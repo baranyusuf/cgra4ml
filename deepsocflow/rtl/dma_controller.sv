@@ -1,5 +1,9 @@
 `timescale 1ns/1ps
 
+// to debug: (* mark_debug = "true" *) input  logic reg_wr_en,
+
+`include "defines.svh"
+
 module dma_controller #(
   parameter
     SRAM_RD_DATA_WIDTH = 32*8,
@@ -10,6 +14,7 @@ module dma_controller #(
     AXIS_USER_WIDTH    = 65  ,
     AXI_LEN_WIDTH      = 32  , // WIDTH_BPT
     AXI_TAG_WIDTH      = 8   , // WIDTH_TAG
+    AXI_WIDTH          = 128 ,
 
   parameter  
     SRAM_WR_DEPTH = SRAM_RD_DEPTH * SRAM_RD_DATA_WIDTH / AXI_DATA_WIDTH, // 2048
@@ -20,20 +25,20 @@ module dma_controller #(
   input  logic rstn,
 
   // SRAM port
-  (* mark_debug = "true" *) input  logic reg_wr_en,
+  input  logic reg_wr_en,
   output logic reg_wr_ack,
-  (* mark_debug = "true" *) input  logic [AXI_ADDR_WIDTH-1:0] reg_wr_addr,
-  (* mark_debug = "true" *) input  logic [AXI_DATA_WIDTH-1:0] reg_wr_data,
-  (* mark_debug = "true" *) input  logic reg_rd_en,
+  input  logic [AXI_ADDR_WIDTH-1:0] reg_wr_addr,
+  input  logic [AXI_DATA_WIDTH-1:0] reg_wr_data,
+  input  logic reg_rd_en,
   output logic reg_rd_ack,
-  (* mark_debug = "true" *) input  logic [AXI_ADDR_WIDTH-1:0] reg_rd_addr, 
-  (* mark_debug = "true" *) output logic [AXI_DATA_WIDTH-1:0] reg_rd_data,
+  input  logic [AXI_ADDR_WIDTH-1:0] reg_rd_addr, 
+  output logic [AXI_DATA_WIDTH-1:0] reg_rd_data,
 
   // AXIS-Out monitoring signals
-  input  logic o_ready, 
   input  logic o_valid,
   input  logic o_last,
   input  logic [AXI_LEN_WIDTH -1:0] o_bpt,  // Varies for each transfer
+  input  logic [AXI_WIDTH     -1:0] o_data,
 
   
   /*
@@ -41,32 +46,29 @@ module dma_controller #(
   input  logic       o_axi_bvalid,
   input  logic       o_axi_bready,
   */
-  // M_AXI-OUT monitoring, to the ping-pong buffer on the PS side (?), we use the status from dma, instead of b_resp
-  input logic  [AXI_TAG_WIDTH -1:0] os_tag,
-  input logic  [3:0] os_error,
-  input logic  os_valid,
 
-  // DMA output descriptor
-  (* mark_debug = "true" *) output logic [AXI_ADDR_WIDTH-1:0]  m_od_addr ,
-  (* mark_debug = "true" *) output logic [AXI_LEN_WIDTH -1:0]  m_od_len  ,
-  (* mark_debug = "true" *) output logic                       m_od_valid,
-  (* mark_debug = "true" *) output logic [AXI_TAG_WIDTH -1:0]  m_od_tag  ,
-  (* mark_debug = "true" *) input  logic                       m_od_ready,
+
 
   // DMA pixels descriptor
-  (* mark_debug = "true" *) output logic [AXI_ADDR_WIDTH-1:0]  m_xd_addr ,
-  (* mark_debug = "true" *) output logic [AXIS_USER_WIDTH-1:0] m_xd_user ,
-  (* mark_debug = "true" *) output logic [AXI_LEN_WIDTH -1:0]  m_xd_len  ,
-  (* mark_debug = "true" *) output logic                       m_xd_valid,
-  (* mark_debug = "true" *) input  logic                       m_xd_ready,
+  output logic [AXI_ADDR_WIDTH-1:0]  m_xd_addr ,
+  output logic [AXIS_USER_WIDTH-1:0] m_xd_user ,
+  output logic [AXI_LEN_WIDTH -1:0]  m_xd_len  ,
+  output logic                       m_xd_valid,
+  input  logic                       m_xd_ready,
 
   // DMA weights descriptor
-  (* mark_debug = "true" *) output logic [AXI_ADDR_WIDTH-1:0]  m_wd_addr ,
-  (* mark_debug = "true" *) output logic [AXIS_USER_WIDTH-1:0] m_wd_user ,
-  (* mark_debug = "true" *) output logic [AXI_LEN_WIDTH -1:0]  m_wd_len  ,
-  (* mark_debug = "true" *) output logic                       m_wd_valid,
-  (* mark_debug = "true" *) input  logic                       m_wd_ready
+  output logic [AXI_ADDR_WIDTH-1:0]  m_wd_addr ,
+  output logic [AXIS_USER_WIDTH-1:0] m_wd_user ,
+  output logic [AXI_LEN_WIDTH -1:0]  m_wd_len  ,
+  output logic                       m_wd_valid,
+  input  logic                       m_wd_ready,
+
+  output logic                          o_ready
 );
+  logic o_ready_gated;
+  assign o_ready_gated = ~((o_last || got_o_last) && ~cfg[A_DONE_READ+ocm_idx][0]);
+  
+  localparam WORDS_IN_CFG = 1024 / (AXI_DATA_WIDTH/8); // 1024 bytes = 256 words for cfg + SRAM
   localparam // Addresses for local memory 0:15 is registers, rest is SRAM
     A_START        = 'h0,
     A_DONE_READ    = 'h1, // 2
@@ -79,18 +81,19 @@ module dma_controller #(
     A_X_DONE       = 'hB, 
     A_O_DONE       = 'hC
     ; // Max 16 registers
-  (* mark_debug = "true" *) logic [AXI_DATA_WIDTH-1:0] cfg [12:0];
+  logic [12:0][AXI_DATA_WIDTH-1:0] cfg ;
 
-  // always_ff @(posedge clk)  // PS READ (1 clock latency)
-  //   if (!rstn)          {reg_rd_data} <= '0;
-  //   else if (reg_rd_en) begin
-  //     //reg_rd_ack  <= reg_rd_en;
-  //     reg_rd_data <= cfg[reg_rd_addr];
-  //   end
 
-  assign reg_rd_data = cfg[reg_rd_addr];
-  assign reg_rd_ack  = reg_rd_en;
-  assign reg_wr_ack  = reg_wr_en;
+  assign reg_wr_ack = 1'b1;
+
+  logic [AXI_ADDR_WIDTH-1:0] reg_rd_addr_valid;
+
+  always_ff @(posedge clk)
+    if (!rstn) {reg_rd_ack, reg_rd_addr_valid} <= '0;
+    else begin
+      reg_rd_ack <= reg_rd_en;
+      reg_rd_addr_valid <= reg_rd_addr;
+    end
 
   //------------------- BUNDLES SRAM  ---------------------------------------
 
@@ -119,20 +122,59 @@ module dma_controller #(
     .doB   (ram_rd_data)
   );
 
+  logic wb_reg_wr_en, wb_reg_rd_en;
+  logic [AXI_ADDR_WIDTH-1:0] wb_reg_wr_addr, wb_reg_rd_addr;
+  logic [AXI_DATA_WIDTH-1:0] wb_reg_wr_data, wb_reg_rd_data;
+
+  writeback #(
+    .SRAM_RD_DEPTH  (SRAM_RD_DEPTH  ),
+    .AXI_ADDR_WIDTH (AXI_ADDR_WIDTH ),
+    .AXI_DATA_WIDTH (AXI_DATA_WIDTH ),
+    .AXI_WIDTH      (AXI_WIDTH      ),
+    .Y_OUT_BITS     (`Y_OUT_BITS    ),
+    .PE_ROWS        (`ROWS          ),
+    .PE_COLS        (`COLS          ),
+    .KW_MAX         (`KW_MAX        ),
+    .NHWC_WORDS     (`NHWC_WORDS    )
+  ) WB (
+    .clk        (clk                     ),
+    .rstn       (rstn                    ),
+    .reg_wr_en  (wb_reg_wr_en            ),
+    .reg_wr_addr(wb_reg_wr_addr          ),
+    .reg_wr_data(wb_reg_wr_data          ),
+    .reg_rd_en  (wb_reg_rd_en            ),
+    .reg_rd_addr(wb_reg_rd_addr          ),
+    .reg_rd_data(wb_reg_rd_data          ),
+    .out_tdata  (o_data                  ),    
+    .out_tvalid (o_valid                 ),    
+    .out_tready_effective (o_ready_gated ),
+    .out_tkeep  ({(AXI_WIDTH/8){1'b1}}   ),
+    .out_tready (o_ready                 ),
+    .out_tlast  (o_last                  )   
+  );
+  always_comb begin
+    wb_reg_wr_en   = reg_wr_en && (reg_wr_addr >= WORDS_IN_CFG);
+    wb_reg_wr_addr = reg_wr_addr - WORDS_IN_CFG;
+    wb_reg_wr_data = reg_wr_data;
+    wb_reg_rd_en   = reg_rd_en && (reg_rd_addr >= WORDS_IN_CFG);
+    wb_reg_rd_addr = reg_rd_addr - WORDS_IN_CFG;
+    reg_rd_data    = reg_rd_addr_valid < WORDS_IN_CFG ? cfg[reg_rd_addr_valid] : wb_reg_rd_data;
+  end
+
   assign ram_wr_en   = reg_wr_en && (reg_wr_addr >= 16);
   assign ram_wr_addr = SRAM_WR_ADDR_WIDTH'(reg_wr_addr - 16);
   assign ram_wr_data = reg_wr_data;
 
    // ram_ are combinational from ram
-  (* mark_debug = "true" *) logic [COUNTER_WIDTH-1:0] ram_max_t, ram_max_p;
-  (* mark_debug = "true" *) logic [31:0] ram_w_bpt, ram_w_bpt_p0, ram_x_bpt, ram_x_bpt_p0, w_bpt, w_bpt_p0, x_bpt, x_bpt_p0;
+  logic [COUNTER_WIDTH-1:0] ram_max_t, ram_max_p;
+  logic [31:0] ram_w_bpt, ram_w_bpt_p0, ram_x_bpt, ram_x_bpt_p0, w_bpt, w_bpt_p0, x_bpt, x_bpt_p0;
   logic [AXI_ADDR_WIDTH-1:0] ram_xb_base_addr;
   logic [63:0] ram_header, x_header, w_header;
   assign {ram_header, ram_max_t, ram_max_p, ram_w_bpt, ram_w_bpt_p0, ram_x_bpt, ram_x_bpt_p0, ram_xb_base_addr} = 256'(ram_rd_data);
 
   // SRAM rd_en arbitration
-  (* mark_debug = "true" *) logic w_ram_rd_en, x_ram_rd_en, w_ram_rd_valid, x_ram_rd_valid;
-  (* mark_debug = "true" *) logic [SRAM_RD_ADDR_WIDTH-1:0] w_ram_rd_addr, x_ram_rd_addr;
+  logic w_ram_rd_en, x_ram_rd_en, w_ram_rd_valid, x_ram_rd_valid;
+  logic [SRAM_RD_ADDR_WIDTH-1:0] w_ram_rd_addr, x_ram_rd_addr;
 
   assign ram_rd_addr = x_ram_rd_en ? x_ram_rd_addr : w_ram_rd_addr;
   assign ram_rd_en   = x_ram_rd_en || w_ram_rd_en;
@@ -192,9 +234,9 @@ module dma_controller #(
 
   //------------------- PIXELS DMA CONTROLLER -----------------------------------
 
-  (* mark_debug = "true" *) logic [COUNTER_WIDTH-1:0] count_xb;
-  (* mark_debug = "true" *) logic en_xt, lc_xt, lc_xp, lc_xb, f_xp, set_n_bundles_x;
-  (* mark_debug = "true" *) enum  {X_IDLE, X_WAIT_RAM, X_WAIT_WRITE, X_EXEC} x_state, x_state_next;
+  logic [COUNTER_WIDTH-1:0] count_xb;
+  logic en_xt, lc_xt, lc_xp, lc_xb, f_xp, set_n_bundles_x;
+  enum  {X_IDLE, X_WAIT_RAM, X_WAIT_WRITE, X_EXEC} x_state, x_state_next;
 
   always_comb begin
     x_state_next = x_state;
@@ -228,8 +270,8 @@ module dma_controller #(
     if (!rstn)               {x_header, x_bpt_p0, x_bpt} <= 0;
     else if (x_ram_rd_valid) {x_header, x_bpt_p0, x_bpt} <= {ram_header, ram_x_bpt_p0, ram_x_bpt};
 
-  (* mark_debug = "true" *) logic [COUNTER_WIDTH-1:0] count_xt_monitor;
-  (* mark_debug = "true" *) logic count_xt_last_monitor;
+  logic [COUNTER_WIDTH-1:0] count_xt_monitor;
+  logic count_xt_last_monitor;
 
   counter #(.W(COUNTER_WIDTH)) C_XT (.clk(clk), .rstn_g(rstn), .rst_l(x_ram_rd_valid  ), .en(en_xt), .max_in(COUNTER_WIDTH'(32'(ram_max_t)     - 1)), .last_clk(lc_xt), .last(count_xt_last_monitor), .first(    ), .count(count_xt_monitor));
   counter #(.W(COUNTER_WIDTH)) C_XP (.clk(clk), .rstn_g(rstn), .rst_l(x_ram_rd_valid  ), .en(lc_xt), .max_in(COUNTER_WIDTH'(32'(ram_max_p)     - 1)), .last_clk(lc_xp), .last(),                      .first(f_xp), .count(        ));
@@ -243,18 +285,15 @@ module dma_controller #(
 
   wire ocm_idx_1 = ocm_idx[0];
   assign ocm_idx_next = 32'(!ocm_idx_1); // next bank to be written by DMA
-  assign m_od_len     = o_bpt;
-  assign m_od_tag     = 8'(ocm_idx);
-  //wire   o_axi_ok     = o_axi_bvalid && o_axi_bready && (o_axi_bresp == 2'b00); // why? what is the resp during transfer?
-  wire o_axi_ok  =  os_valid && (os_error == 4'b0);
+
+  
+
 
   always_ff @(posedge clk) // All cfg written in this always block
     if (!rstn) begin 
       cfg[A_START       ] <= 0; 
       cfg[A_DONE_READ +0] <= 32'd1;
       cfg[A_DONE_READ +1] <= 32'd1;
-      cfg[A_DONE_WRITE+0] <= 32'd0;
-      cfg[A_DONE_WRITE+1] <= 32'd0;
       cfg[A_OCM_BASE  +0] <= 32'd0;
       cfg[A_OCM_BASE  +1] <= 32'd0;
       cfg[A_WEIGHTS_BASE] <= 32'd0;
@@ -262,33 +301,25 @@ module dma_controller #(
       cfg[A_N_BUNDLES_1 ] <= 32'd0;
       cfg[A_W_DONE      ] <= 32'd0;
       cfg[A_X_DONE      ] <= 32'd0;
-      cfg[A_O_DONE      ] <= 32'd0;
 
-      ocm_idx     <= 1; // before first transfer idx = 1, so first idx = 0
-      m_od_addr   <= 0;
-      m_od_valid  <= 0;
-      got_o_last  <= 1; // to say first o_bpt comes from engine is for new data
+      ocm_idx     <= 0; 
+      got_o_last  <= 0; // to say first o_bpt comes from engine is for new data
     end else begin
 
-      if (o_valid && o_ready && o_last) // previous packet completed(AXIS from engine to DMA) , only @ 1 cycle
+      if (o_valid && o_ready_gated && o_last) begin // previous packet completed(AXIS from engine to DMA) , only @ 1 cycle
         got_o_last <= 1;
+        cfg[A_DONE_READ+ocm_idx] <= 0;
+      end
 
-      if (m_od_ready && o_valid && got_o_last) begin // DMA wants descriptor + o_bpt from engine is valid + o_bpt is for new data
+
+      if (got_o_last) begin // DMA wants descriptor + o_bpt from engine is valid + o_bpt is for new data
         if (cfg[A_DONE_READ+ocm_idx_next][0]) begin  // wait for NEXT bank to done reading
-          cfg[A_DONE_READ +ocm_idx_next] <= 0;   // clear done_read flag
-          cfg[A_DONE_WRITE+ocm_idx_next] <= 0;   // tell PS NEXT bank is being written
           ocm_idx    <= ocm_idx_next;   // switch bank in next clock
-          m_od_addr  <= cfg[A_OCM_BASE+ocm_idx_next];
-          m_od_valid <= 1; // next clock, DMA will get valid; addr & length are given combinatinally
           got_o_last <= 0;
         end
       end
    
-      if (m_od_valid && m_od_ready) // desc_valid stays high for only 1 clock with ready (this gets priority)
-        m_od_valid <= 0;
 
-      if (o_axi_ok) // DMA has completed writing THIS bank
-        cfg[A_DONE_WRITE+os_tag] <= 1;
 
     // --------------------------------- OTHER REGISTERS -----------------------------------
 
@@ -302,10 +333,6 @@ module dma_controller #(
       cfg[A_W_DONE] <= AXI_DATA_WIDTH'(w_state == W_IDLE);
       cfg[A_X_DONE] <= AXI_DATA_WIDTH'(x_state == X_IDLE);
 
-      if (cfg[A_START][0] || o_valid) // not done if engine wants to send data
-        cfg[A_O_DONE] <= 0;
-      else if (got_o_last && o_axi_ok) // O has no state, so hv to infer from AXIS tlast & AXI resp
-        cfg[A_O_DONE] <= 1;
 
       //reg_wr_ack <= reg_wr_en; // Write has 1 clock latency
       if (reg_wr_en && reg_wr_addr < 16) // PS has priority in writing to registers
@@ -315,8 +342,6 @@ module dma_controller #(
     wire        cfg_A_START        = 1'(cfg[A_START       ]); 
     wire        cfg_A_DONE_READ_0  = 1'(cfg[A_DONE_READ +0]);  // 2
     wire        cfg_A_DONE_READ_1  = 1'(cfg[A_DONE_READ +1]);  // 2
-    wire        cfg_A_DONE_WRITE_0 = 1'(cfg[A_DONE_WRITE+0]);  // 2
-    wire        cfg_A_DONE_WRITE_1 = 1'(cfg[A_DONE_WRITE+1]);  // 2
     wire [31:0] cfg_A_OCM_BASE_0   =    cfg[A_OCM_BASE  +0];   // 2
     wire [31:0] cfg_A_OCM_BASE_1   =    cfg[A_OCM_BASE  +1];   // 2
     wire [31:0] cfg_A_WEIGHTS_BASE =    cfg[A_WEIGHTS_BASE]; 

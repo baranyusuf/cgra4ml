@@ -1,5 +1,5 @@
 # Top level rtl module
-add_files  [glob $CONFIG_DIR/*.svh] [glob $RTL_DIR/*] [glob $RTL_DIR/ext/*]
+add_files  [glob $CONFIG_DIR/*] [glob $RTL_DIR/*] [glob $RTL_DIR/ext/*]
 update_compile_order -fileset sources_1
 
 set_property top axi_cgra4ml [current_fileset]

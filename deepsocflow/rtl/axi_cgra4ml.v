@@ -141,7 +141,7 @@ localparam      OUT_ADDR_WIDTH          = 10,
                 TIMEOUT                 = 2, // since 0 gives error
 
     // Alex AXI DMA RD                
-                AXIS_ID_WIDTH           = AXI_ID_WIDTH,
+                AXIS_ID_WIDTH           = 6,
                 AXIS_KEEP_ENABLE        = 1,//(AXI_WIDTH>8),
                 AXIS_KEEP_WIDTH         = (AXI_WIDTH/8),//(AXI_WIDTH/8),
                 AXIS_LAST_ENABLE        = 1,
@@ -167,15 +167,6 @@ wire reg_rd_en;
 wire [AXIL_WIDTH-1:0] reg_rd_data;
 wire reg_rd_ack;
 
-// Controller with Alex DMAs: desc signals (including od tag) and status signals
-wire [AXI_ADDR_WIDTH+AXI_LEN_WIDTH-1:0] m_od_axis_write_desc_tdata;
-wire m_od_axis_write_desc_tvalid;
-wire m_od_axis_write_desc_tready;
-wire [TAG_WIDTH-1:0] m_od_axis_write_desc_tag;
-wire [TAG_WIDTH-1:0] m_os_axis_write_desc_status_tag;
-wire [3:0] m_os_axis_write_desc_status_error;
-wire m_os_axis_write_desc_status_valid;
-
 
 wire [AXI_ADDR_WIDTH+AXI_LEN_WIDTH-1:0] m_xd_axis_write_desc_tdata;
 wire [AXIS_USER_WIDTH-1:0] m_xd_axis_write_desc_tuser;
@@ -188,27 +179,27 @@ wire m_wd_axis_write_desc_tvalid;
 wire m_wd_axis_write_desc_tready;
 
 // AXIS input & outputs to DNN engine
-wire                       s_axis_pixels_tready, s_axis_pixels_skid_tready ;
-wire                       s_axis_pixels_tvalid, s_axis_pixels_skid_tvalid ;
-wire                       s_axis_pixels_tlast , s_axis_pixels_skid_tlast  ;
-wire [AXI_WIDTH  -1:0]     s_axis_pixels_tdata , s_axis_pixels_skid_tdata  ;
-wire [AXI_WIDTH/8-1:0]     s_axis_pixels_tkeep , s_axis_pixels_skid_tkeep  ;
-wire [AXIS_USER_WIDTH-1:0] s_axis_pixels_tuser , s_axis_pixels_skid_tuser  ;
+wire s_axis_pixels_tready;
+wire s_axis_pixels_tvalid;
+wire s_axis_pixels_tlast ;
+wire [AXI_WIDTH  -1:0]   s_axis_pixels_tdata;
+wire [AXI_WIDTH/8-1:0]   s_axis_pixels_tkeep;
+wire [AXIS_USER_WIDTH-1:0] s_axis_pixels_tuser;
 
-wire                       s_axis_weights_tready, s_axis_weights_skid_tready;
-wire                       s_axis_weights_tvalid, s_axis_weights_skid_tvalid;
-wire                       s_axis_weights_tlast , s_axis_weights_skid_tlast ;
-wire [AXI_WIDTH  -1:0]     s_axis_weights_tdata , s_axis_weights_skid_tdata ;
-wire [AXI_WIDTH/8-1:0]     s_axis_weights_tkeep , s_axis_weights_skid_tkeep ;
-wire [AXIS_USER_WIDTH-1:0] s_axis_weights_tuser , s_axis_weights_skid_tuser ;
+wire s_axis_weights_tready;
+wire s_axis_weights_tvalid;
+wire s_axis_weights_tlast ;
+wire [AXI_WIDTH  -1:0]  s_axis_weights_tdata;
+wire [AXI_WIDTH/8-1:0]  s_axis_weights_tkeep;
+wire [AXIS_USER_WIDTH-1:0] s_axis_weights_tuser;
 
     // AND, controller monitors the axis output status
-wire                    m_axis_output_tready, m_axis_output_skid_tready;
-wire                    m_axis_output_tvalid, m_axis_output_skid_tvalid;
-wire                    m_axis_output_tlast , m_axis_output_skid_tlast ;
-wire [AXI_WIDTH   -1:0] m_axis_output_tdata , m_axis_output_skid_tdata ;
-wire [AXI_WIDTH/8 -1:0] m_axis_output_tkeep , m_axis_output_skid_tkeep ;
-wire [W_BPT-1:0]        m_bytes_per_transfer, m_bytes_per_transfer_skid;
+wire m_axis_output_tready; 
+wire m_axis_output_tvalid;
+wire m_axis_output_tlast;
+wire [AXI_WIDTH   -1:0] m_axis_output_tdata;
+wire [AXI_WIDTH/8 -1:0] m_axis_output_tkeep;
+wire [W_BPT-1:0] m_bytes_per_transfer;
 
 wire [AXIL_ADDR_WIDTH-1:0] reg_wr_addr_ctrl = (reg_wr_addr-AXIL_BASE_ADDR) >> 2;
 wire [AXIL_ADDR_WIDTH-1:0] reg_rd_addr_ctrl = (reg_rd_addr-AXIL_BASE_ADDR) >> 2;
@@ -264,11 +255,13 @@ dma_controller #(
     .AXIS_USER_WIDTH(AXIS_USER_WIDTH),
     .AXI_DATA_WIDTH(AXIL_WIDTH),
     .AXI_LEN_WIDTH(AXI_LEN_WIDTH),
-    .AXI_TAG_WIDTH(TAG_WIDTH)
+    .AXI_TAG_WIDTH(TAG_WIDTH),
+    .AXI_WIDTH(AXI_WIDTH)
 ) CONTROLLER (
     .clk(clk),
     .rstn(rstn),
     .reg_wr_en(reg_wr_en),
+	.o_ready(m_axis_output_tready),
     .reg_wr_ack(reg_wr_ack),
     .reg_wr_addr(reg_wr_addr_ctrl[AXI_ADDR_WIDTH-1:0]),
     .reg_wr_data(reg_wr_data),
@@ -276,18 +269,10 @@ dma_controller #(
     .reg_rd_ack(reg_rd_ack),
     .reg_rd_addr(reg_rd_addr_ctrl[AXI_ADDR_WIDTH-1:0]),
     .reg_rd_data(reg_rd_data),
-    .o_ready(m_axis_output_skid_tready),
-    .o_valid(m_axis_output_skid_tvalid),
-    .o_last(m_axis_output_skid_tlast),
-    .o_bpt(m_bytes_per_transfer_skid),
-    .os_tag(m_os_axis_write_desc_status_tag),
-    .os_error(m_os_axis_write_desc_status_error),
-    .os_valid(m_os_axis_write_desc_status_valid),
-    .m_od_addr(m_od_axis_write_desc_tdata[AXI_ADDR_WIDTH-1:0]),
-    .m_od_len(m_od_axis_write_desc_tdata[AXI_ADDR_WIDTH+AXI_LEN_WIDTH-1:AXI_ADDR_WIDTH]),
-    .m_od_valid(m_od_axis_write_desc_tvalid),
-    .m_od_ready(m_od_axis_write_desc_tready),
-    .m_od_tag(m_od_axis_write_desc_tag),
+    .o_valid(m_axis_output_tvalid),
+    .o_last(m_axis_output_tlast),
+    .o_bpt(m_bytes_per_transfer),
+    .o_data(m_axis_output_tdata), 
     .m_xd_addr(m_xd_axis_write_desc_tdata[AXI_ADDR_WIDTH-1:0]),
     .m_xd_user(m_xd_axis_write_desc_tuser),
     .m_xd_len(m_xd_axis_write_desc_tdata[AXI_ADDR_WIDTH+AXI_LEN_WIDTH-1:AXI_ADDR_WIDTH]),
@@ -337,45 +322,6 @@ dnn_engine #(
     .m_bytes_per_transfer(m_bytes_per_transfer)
 );
 
-skid_buffer #(
-  .WIDTH(AXI_WIDTH + AXI_WIDTH/8 + AXIS_USER_WIDTH + 1)
-  ) SKID_X (
-  .clk     (clk ),
-  .rstn    (rstn),
-  .s_ready (s_axis_pixels_skid_tready ),
-  .s_valid (s_axis_pixels_skid_tvalid ),
-  .s_data  ({s_axis_pixels_skid_tdata, s_axis_pixels_skid_tuser, s_axis_pixels_skid_tkeep, s_axis_pixels_skid_tlast}),
-  .m_ready (s_axis_pixels_tready      ),
-  .m_valid (s_axis_pixels_tvalid      ),
-  .m_data  ({s_axis_pixels_tdata,      s_axis_pixels_tuser,      s_axis_pixels_tkeep,      s_axis_pixels_tlast     })
-);
-
-skid_buffer #(
-  .WIDTH(AXI_WIDTH + AXI_WIDTH/8 + AXIS_USER_WIDTH + 1)
-  ) SKID_W (
-  .clk     (clk ),
-  .rstn    (rstn),
-  .s_ready (s_axis_weights_skid_tready ),
-  .s_valid (s_axis_weights_skid_tvalid ),
-  .s_data  ({s_axis_weights_skid_tdata, s_axis_weights_skid_tuser, s_axis_weights_skid_tkeep, s_axis_weights_skid_tlast}),
-  .m_ready (s_axis_weights_tready      ),
-  .m_valid (s_axis_weights_tvalid      ),
-  .m_data  ({s_axis_weights_tdata,      s_axis_weights_tuser,      s_axis_weights_tkeep,      s_axis_weights_tlast     })
-);
-
-skid_buffer #(
-  .WIDTH(AXI_WIDTH + AXI_WIDTH/8 + W_BPT + 1)
-  ) SKID_Y (
-  .clk     (clk ),
-  .rstn    (rstn),
-  .s_ready (m_axis_output_tready),
-  .s_valid (m_axis_output_tvalid),
-  .s_data  ({m_axis_output_tdata,      m_axis_output_tkeep,      m_bytes_per_transfer,        m_axis_output_tlast     }),
-  .m_ready (m_axis_output_skid_tready),
-  .m_valid (m_axis_output_skid_tvalid),
-  .m_data  ({m_axis_output_skid_tdata, m_axis_output_skid_tkeep, m_bytes_per_transfer_skid,   m_axis_output_skid_tlast})
-);
-
 alex_axi_dma_rd #(
     .AXI_DATA_WIDTH(AXI_WIDTH   ),
     .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
@@ -409,14 +355,14 @@ alex_axi_dma_rd #(
     .m_axis_read_desc_status_tag(),
     .m_axis_read_desc_status_error(),
     .m_axis_read_desc_status_valid(),
-    .m_axis_read_data_tdata(s_axis_pixels_skid_tdata),
-    .m_axis_read_data_tkeep(s_axis_pixels_skid_tkeep),
-    .m_axis_read_data_tvalid(s_axis_pixels_skid_tvalid),
-    .m_axis_read_data_tready(s_axis_pixels_skid_tready),
-    .m_axis_read_data_tlast(s_axis_pixels_skid_tlast),
+    .m_axis_read_data_tdata(s_axis_pixels_tdata),
+    .m_axis_read_data_tkeep(s_axis_pixels_tkeep),
+    .m_axis_read_data_tvalid(s_axis_pixels_tvalid),
+    .m_axis_read_data_tready(s_axis_pixels_tready),
+    .m_axis_read_data_tlast(s_axis_pixels_tlast),
     .m_axis_read_data_tid(),
     .m_axis_read_data_tdest(),
-    .m_axis_read_data_tuser(s_axis_pixels_skid_tuser),
+    .m_axis_read_data_tuser(s_axis_pixels_tuser),
     .m_axi_arid(m_axi_pixel_arid),
     .m_axi_araddr(m_axi_pixel_araddr),
     .m_axi_arlen(m_axi_pixel_arlen),
@@ -469,14 +415,14 @@ alex_axi_dma_rd #(
     .m_axis_read_desc_status_tag(),
     .m_axis_read_desc_status_error(),
     .m_axis_read_desc_status_valid(),
-    .m_axis_read_data_tdata(s_axis_weights_skid_tdata),
-    .m_axis_read_data_tkeep(s_axis_weights_skid_tkeep),
-    .m_axis_read_data_tvalid(s_axis_weights_skid_tvalid),
-    .m_axis_read_data_tready(s_axis_weights_skid_tready),
-    .m_axis_read_data_tlast(s_axis_weights_skid_tlast),
+    .m_axis_read_data_tdata(s_axis_weights_tdata),
+    .m_axis_read_data_tkeep(s_axis_weights_tkeep),
+    .m_axis_read_data_tvalid(s_axis_weights_tvalid),
+    .m_axis_read_data_tready(s_axis_weights_tready),
+    .m_axis_read_data_tlast(s_axis_weights_tlast),
     .m_axis_read_data_tid(),
     .m_axis_read_data_tdest(),
-    .m_axis_read_data_tuser(s_axis_weights_skid_tuser),
+    .m_axis_read_data_tuser(s_axis_weights_tuser),
     .m_axi_arid(m_axi_weights_arid),
     .m_axi_araddr(m_axi_weights_araddr),
     .m_axi_arlen(m_axi_weights_arlen),
@@ -496,69 +442,22 @@ alex_axi_dma_rd #(
     .enable(1'b1)
 );
 
-alex_axi_dma_wr #(
-    .AXI_DATA_WIDTH(AXI_WIDTH   ),
-    .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH),
-    .AXI_STRB_WIDTH(AXI_STRB_WIDTH),
-    .AXI_ID_WIDTH(AXI_ID_WIDTH),
-    .AXI_MAX_BURST_LEN(AXI_MAX_BURST_LEN),
-    .AXIS_DATA_WIDTH(AXI_WIDTH),
-    .AXIS_KEEP_ENABLE(AXIS_KEEP_ENABLE),
-    .AXIS_KEEP_WIDTH(AXIS_KEEP_WIDTH),
-    .AXIS_LAST_ENABLE(AXIS_LAST_ENABLE),
-    .AXIS_ID_ENABLE(AXIS_ID_ENABLE),
-    .AXIS_ID_WIDTH(AXIS_ID_WIDTH),
-    .AXIS_DEST_ENABLE(AXIS_DEST_ENABLE),
-    .AXIS_DEST_WIDTH(AXIS_DEST_WIDTH),
-    .AXIS_USER_ENABLE(0),
-    .AXIS_USER_WIDTH(AXIS_USER_WIDTH),
-    .LEN_WIDTH(LEN_WIDTH),
-    .TAG_WIDTH(TAG_WIDTH),
-    .ENABLE_SG(ENABLE_SG),
-    .ENABLE_UNALIGNED(ENABLE_UNALIGNED)
-) OUT_DMA (
-    .clk(clk),
-    .rstn(rstn),
-    .s_axis_write_desc_tdata(m_od_axis_write_desc_tdata),
-    .s_axis_write_desc_tag(m_od_axis_write_desc_tag),
-    .s_axis_write_desc_tvalid(m_od_axis_write_desc_tvalid),
-    .s_axis_write_desc_tready(m_od_axis_write_desc_tready),
-    .m_axis_write_desc_status_len(),
-    .m_axis_write_desc_status_tag(m_os_axis_write_desc_status_tag),
-    .m_axis_write_desc_status_id(),
-    .m_axis_write_desc_status_dest(),
-    .m_axis_write_desc_status_user(),
-    .m_axis_write_desc_status_error(m_os_axis_write_desc_status_error),
-    .m_axis_write_desc_status_valid(m_os_axis_write_desc_status_valid),
-    .s_axis_write_data_tdata(m_axis_output_skid_tdata),
-    .s_axis_write_data_tkeep(m_axis_output_skid_tkeep),
-    .s_axis_write_data_tvalid(m_axis_output_skid_tvalid),
-    .s_axis_write_data_tready(m_axis_output_skid_tready),
-    .s_axis_write_data_tlast(m_axis_output_skid_tlast),
-    .s_axis_write_data_tid(),
-    .s_axis_write_data_tdest(),
-    .s_axis_write_data_tuser(),
-    .m_axi_awid(m_axi_output_awid),
-    .m_axi_awaddr(m_axi_output_awaddr),
-    .m_axi_awlen(m_axi_output_awlen),
-    .m_axi_awsize(m_axi_output_awsize),
-    .m_axi_awburst(m_axi_output_awburst),
-    .m_axi_awlock(m_axi_output_awlock),
-    .m_axi_awcache(m_axi_output_awcache),
-    .m_axi_awprot(m_axi_output_awprot),
-    .m_axi_awvalid(m_axi_output_awvalid),
-    .m_axi_awready(m_axi_output_awready),
-    .m_axi_wdata(m_axi_output_wdata),
-    .m_axi_wstrb(m_axi_output_wstrb),
-    .m_axi_wlast(m_axi_output_wlast),
-    .m_axi_wvalid(m_axi_output_wvalid),
-    .m_axi_wready(m_axi_output_wready),
-    .m_axi_bid(m_axi_output_bid),
-    .m_axi_bresp(m_axi_output_bresp),
-    .m_axi_bvalid(m_axi_output_bvalid),
-    .m_axi_bready(m_axi_output_bready),
-    .enable(1'b1),
-    .abort(1'b0)
-);
+
+
+assign m_axi_output_awid    = {AXI_ID_WIDTH{1'b0}};
+assign m_axi_output_awaddr  = {AXI_ADDR_WIDTH{1'b0}};
+assign m_axi_output_awlen   = 8'b0;
+assign m_axi_output_awsize  = 3'b0;
+assign m_axi_output_awburst = 2'b0;
+assign m_axi_output_awlock  = 1'b0;
+assign m_axi_output_awcache = 4'b0;
+assign m_axi_output_awprot  = 3'b0;
+assign m_axi_output_awvalid = 1'b0;
+assign m_axi_output_wdata   = {AXI_WIDTH{1'b0}};
+assign m_axi_output_wstrb   = {AXI_STRB_WIDTH{1'b0}};
+assign m_axi_output_wlast   = 1'b0;
+assign m_axi_output_wvalid  = 1'b0;
+assign m_axi_output_bready  = 1'b0;
+
 
 endmodule

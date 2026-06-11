@@ -48,7 +48,12 @@ typedef double   f64;
 
 #else
   #define sim_fprintf(...)
-  #define mem_phy (*(Memory_st* restrict)MEM_BASEADDR)
+
+  #ifdef RISCV
+    Memory_st mem_phy;
+  #else
+    #define mem_phy (*(Memory_st* restrict)MEM_BASEADDR)
+  #endif
 
   volatile u32 fb_read_reg32(void *addr){
     return *(volatile u32 *)addr;
@@ -72,11 +77,11 @@ typedef double   f64;
 
 extern EXT_C u32 fb_addr_64to32(void* restrict addr){
   u64 offset = (u64)addr - (u64)&mem_phy;
-  return (u32)offset + 0x2000000;
+  return (u32)offset + MEM_BASEADDR;
 }
 
 extern EXT_C u64 fb_sim_addr_32to64(u32 addr){
-  return (u64)addr - (u64)0x2000000 + (u64)&mem_phy;
+  return (u64)addr - (u64)MEM_BASEADDR + (u64)&mem_phy;
 }
 
 extern EXT_C u8 fb_c_read_ddr8_addr32 (u32 addr_32){

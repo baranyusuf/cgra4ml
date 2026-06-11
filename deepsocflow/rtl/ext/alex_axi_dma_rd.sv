@@ -27,7 +27,7 @@ THE SOFTWARE.
 `resetall
 `timescale 1ns / 1ps
 
-`include "defines.svh"
+`include "../defines.svh"
 
 /*
  * AXI4 DMA
@@ -72,8 +72,7 @@ module alex_axi_dma_rd #
     // (multiple descriptors per AXI stream frame)
     parameter ENABLE_SG = 0,
     // Enable support for unaligned transfers
-    parameter ENABLE_UNALIGNED = 1,
-    parameter logic [AXI_ID_WIDTH-1:0] AXI_ID = 0
+    parameter ENABLE_UNALIGNED = 1
 )
 (
     input  wire                       clk,
@@ -136,8 +135,6 @@ module alex_axi_dma_rd #
      */
     input  wire                       enable
 );
-
-initial $display("%m AXI_MAX_BURST_LEN=%0d", AXI_MAX_BURST_LEN);
 
 localparam AXI_WORD_WIDTH = AXI_STRB_WIDTH;
 localparam AXI_WORD_SIZE = AXI_DATA_WIDTH/AXI_WORD_WIDTH;
@@ -301,7 +298,7 @@ assign m_axis_read_desc_status_tag = m_axis_read_desc_status_tag_reg;
 assign m_axis_read_desc_status_error = m_axis_read_desc_status_error_reg;
 assign m_axis_read_desc_status_valid = m_axis_read_desc_status_valid_reg;
 
-assign m_axi_arid = AXI_ID;
+assign m_axi_arid = {AXI_ID_WIDTH{1'b0}};
 assign m_axi_araddr = m_axi_araddr_reg;
 assign m_axi_arlen = m_axi_arlen_reg;
 assign m_axi_arsize = 3'(AXI_BURST_SIZE);

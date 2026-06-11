@@ -248,7 +248,31 @@ def reorder_y_q2e_conv(y, hw, r):
 
     y = y.reshape(r.IT,r.XN,r.XL,r.XW*r.CO_PRL,hw.ROWS)
     y[:,:,:,-(r.KW//2+1)*r.CO_PRL:,:] = y_w_last
-    return y
+    
+    KW2 = r.KW // 2
+    normal_wc_end = (r.XW - KW2 - 1) * r.CO_PRL
+
+    flat_valid = []
+    for it in range(r.IT):
+        for n in range(r.XN):
+            for il in range(r.XL):
+                for wc in range(r.XW * r.CO_PRL):
+                    if wc < normal_wc_end:
+                        icoe = wc % r.CO_PRL
+                    else:
+                        icoe = (wc - normal_wc_end) // (KW2 + 1)
+
+                    iyc = it * r.CO_PRL + icoe
+                    if iyc >= r.CO:
+                        continue
+
+                    for ir in range(hw.ROWS):
+                        iyh = il * hw.ROWS + ir
+                        if iyh >= r.XH:
+                            continue
+                        flat_valid.append(y[it, n, il, wc, ir])
+
+    return np.array(flat_valid, dtype=np.int32)
 
 
 def reorder_y_e2q_conv(y, hw, r):

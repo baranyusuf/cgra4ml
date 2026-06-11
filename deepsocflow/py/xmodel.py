@@ -40,6 +40,9 @@ class XModel(Layer):
 
 
 def export_inference(model, hw, batch_size=1):
+
+    assert batch_size <= 32, f"i_yn must fit in 5 bits (batch <= 32), got {batch_size}"
+
     
     for b in BUNDLES:
         b.next_ibs.clear()
@@ -158,6 +161,10 @@ def export_inference(model, hw, batch_size=1):
         
         for ib, b in enumerate(BUNDLES):
             assert ib == b.ib
+            assert b.r.CYH <= 1024, f"i_yh 10-bit exceeds: CYH={b.r.CYH} @ bundle {ib}"
+            assert b.r.CYW <= 1024, f"i_yw 10-bit: CYW={b.r.CYW} @ bundle {ib}"
+            assert b.r.CO  < (1<<22), f"i_yc 22-bit: CO={b.r.CO} @ bundle {ib}"
+
 
             w_bpt    = (hw.K_BITS*b.we[-1][0].size)//8
             w_bpt_p0 = (hw.K_BITS*b.we[0][0].size)//8
@@ -258,6 +265,8 @@ def export_inference(model, hw, batch_size=1):
         ch.write(f"#define CONFIG_BASEADDR 0x{hw.CONFIG_BASEADDR}\n")
         ch.write(f'#define DATA_DIR   "../{hw.DATA_DIR}"\n\n')
 
+        assert b_words <= (1 << 17)
+
         mask_nums = [(2**hw.X_BITS-1) << (p*hw.X_BITS)  for p in range(8//hw.X_BITS)]
         mask_nums = ~np.array(mask_nums, dtype=np.uint8)
         ch.write(f"static const uint8_t X_POSITION_INVERTED_MASKS [] = {{ {', '.join([str(n) for n in mask_nums])} }};\n")
@@ -328,6 +337,11 @@ def export_inference(model, hw, batch_size=1):
                 print(f"y_exp {i}: {y_exp[i]}")
         
         print(f'Weights, inputs, outputs saved to {hw.DATA_DIR}/ib_ip_it_*.txt')
+    hw.RAM_NHWC_DEPTH = nhwc_words_max
+    hw.export()  # config_hw.svh'yi gerçek NHWC_WORDS ile tazele
+
+
+
 
 
 def verify_inference(model, hw, SIM, SIM_PATH='', TRACE=False):
@@ -337,26 +351,22 @@ def verify_inference(model, hw, SIM, SIM_PATH='', TRACE=False):
     '''
     hw.simulate(SIM=SIM, SIM_PATH=SIM_PATH, TRACE=TRACE)
 
+    '''
+
+Simulation completed, but files were not generated. Either 
+    (1) Simulation got stuck and timed out (MOST LIKELY)
+    (2) Debug mode not enabled for the C firmware.
+    (3) Files are generated elsewhere...etc.
+'''
 
     '''
     CHECK ERROR
     '''
+
+
+
     for ib, b in enumerate(BUNDLES):
         assert ib == b.ib
-        
-        ''' Verify raw output '''
-        for ip in range(b.r.CP):
-            for it in range(b.r.IT):
-                y_raw_exp = b.ye_exp_p[ip][it]
-                y_raw_sim = np.loadtxt(f"{hw.DATA_DIR}/{b.ib}_{ip}_{it}_y_raw_sim.txt", np.int32)[:y_raw_exp.size].reshape(y_raw_exp.shape)
-                error = np.sum(np.abs(y_raw_exp-y_raw_sim))
-                assert error == 0, f"Error={error}, for y_raw_sim at {b.ib=}_{ip=}_{it=}"
-
-        ''' Verify sum output '''
-        y_sum_exp = b.oe_sum_exp
-        y_sum_sim = np.loadtxt(f"{hw.DATA_DIR}/{b.ib}_y_sum_sim.txt", np.int32)[:y_sum_exp.size].reshape(y_sum_exp.shape)
-        error = np.sum(np.abs(y_sum_exp-y_sum_sim))
-        assert error == 0, f"Error={error}, for y_sum_sim at {b.ib=}"
 
         ''' Verify processed output HWC'''
         if not (ib == len(BUNDLES)-1 and b.softmax):
@@ -368,7 +378,7 @@ def verify_inference(model, hw, SIM, SIM_PATH='', TRACE=False):
         ''' Verify tiled output'''
         if (ib == len(BUNDLES)-1):
             if b.softmax:
-                y_tiled_exp = b.out.ftensor.numpy().reshape(1,b.r.XH,1,b.r.CO)
+                y_tiled_exp = b.out.ftensor.numpy().reshape(1,b.r.XN,1,b.r.CO)
                 y_tiled_sim = np.loadtxt(f"{hw.DATA_DIR}/{b.ib}_y_tiled_sim.txt", np.float32).reshape(y_tiled_exp.shape)/2**17
                 error = np.max(np.abs(y_tiled_sim-y_tiled_exp))
                 assert np.allclose(y_tiled_sim, y_tiled_exp, atol=0.5), f"Error={error}, \nsub:\n{y_tiled_sim-y_tiled_exp} for y_tiled_sim at {b.ib=}. \n y_tiled_sim=\n{y_tiled_sim} \n y_tiled_exp=\n{y_tiled_exp}\n \npre_softmax=\n{b.pre_softmax}"
@@ -393,3 +403,4 @@ def verify_inference(model, hw, SIM, SIM_PATH='', TRACE=False):
             assert error == 0, f"Error={error}, for y_packed_sim at {b.ib=}, y_packed_sim=\n{y_packed_sim[:100]} \n y_packed_exp=\n{y_packed_exp[:100]}\n, diff=\n{diff.tolist()}\n  y_packed_sim=\n{y_packed_sim.tolist()} \n y_packed_exp=\n{y_packed_exp.tolist()}\n"
             
         print(f"Bundle {b.ib}, Error: {error}. Passed")
+

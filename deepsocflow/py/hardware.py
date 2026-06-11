@@ -22,6 +22,7 @@ class Hardware:
             bits_bias: int = 16, 
             max_batch_size: int = 512, 
             max_channels_in: int = 512, 
+            max_channels_out: int = 512,
             max_kernel_size: int = 13, 
             max_image_size: int = 32, 
             max_n_bundles: int = 64,
@@ -35,8 +36,7 @@ class Hardware:
             async_resetn: bool = True,
             valid_prob: float = 0.01,
             ready_prob: float = 0.1,
-            data_dir: str = 'vectors/',
-            tb_module: str = 'top_tb',
+            data_dir: str = 'vectors/'
             ):
         """
         Args:
@@ -98,6 +98,7 @@ class Hardware:
         self.L_MAX                 = int(np.ceil(self.XH_MAX//self.ROWS))
         self.CONFIG_BEATS          = 0
         self.X_PAD_MAX             = int(np.ceil(self.KH_MAX//2))
+        self.RAM_NHWC_DEPTH        = 0 
         self.BITS_KW2              = clog2((self.KW_MAX+1)/2)
         self.BITS_KH2              = clog2((self.KH_MAX+1)/2)
         self.BITS_CIN_MAX          = clog2(self.CI_MAX)
@@ -107,9 +108,8 @@ class Hardware:
         self.BITS_RAM_WEIGHTS_ADDR = clog2(self.RAM_WEIGHTS_DEPTH)
         self.Y_OUT_BITS            = 2**clog2(self.Y_BITS)
         self.W_BPT                 = 32#clog2(self.ROWS*self.COLS*self.Y_OUT_BITS/8)
-
         self.MODULE_DIR = os.path.normpath(os.path.dirname(deepsocflow.__file__)).replace('\\', '/')
-        self.TB_MODULE = tb_module
+        self.TB_MODULE = "top_tb"
         self.SOURCES = \
             glob.glob(f'{self.MODULE_DIR}/test/sv/*.sv') + \
             glob.glob(f'{self.MODULE_DIR}/test/sv/**/*.v') + \
@@ -191,8 +191,33 @@ class Hardware:
 `define HEADER_WIDTH        {self.HEADER_WIDTH       :<10}
 `define AXI_MAX_BURST_LEN   {self.AXI_MAX_BURST_LEN  :<10}
 `define CONFIG_BASEADDR     32'h{self.CONFIG_BASEADDR:<10}
+`define NHWC_WORDS          {self.RAM_NHWC_DEPTH     :<10} 
 ''')
 
+        with open('config_reg.def', 'w') as f:
+                f.write(f'''
+WB_A_START           = 0,
+WB_A_N_BUNDLES_1     ,
+WB_A_EN_COUNT        ,
+WB_A_ALL_DONE        ,
+WB_A_ADDR_EN_COUNTER ,     
+WB_A_ADDR_DONE       ,  
+WB_A_ADDR_IYN        ,   
+WB_A_ADDR_IYC        ,
+WB_A_I_BIAS          ,   
+WB_A_IY_NHWC_CONV    ,
+WB_A_ADDR_INVALID    ,
+WB_A_DONE_WRITE_0    ,
+WB_A_DONE_WRITE_1    ,
+WB_A_DONE_WRITE_ANY  ,
+WB_A_OUT_VAL_HW      ,
+WB_A_ICH_QUOT        ,  
+WB_A_ICW_QUOT        ,
+WB_A_BUNDLE_STATUS   ,
+WB_A_PIXEL_PACK      ,
+WB_A_OUT_FLAGS       ,
+WB_A_PIXEL_PACK2     ,                                                                                           
+''')
 
         with open('config_hw.tcl', 'w') as f:
             f.write(f'''
@@ -216,12 +241,15 @@ set CONFIG_BASEADDR    0x{self.CONFIG_BASEADDR}
 
     def simulate(self, SIM='verilator', SIM_PATH='', TRACE=False):
 
+        print("MODULE_DIR =", self.MODULE_DIR)
+
+
         os.makedirs('build', exist_ok=True)
         print("\n\nCOMPILING...\n\n")
 
         if SIM == 'xsim':
             assert subprocess.run(cwd="build", shell=True, args=fr'{SIM_PATH}xsc {self.MODULE_DIR}/c/sim.c --gcc_compile_options -I../ --gcc_compile_options -I{self.MODULE_DIR}/firebridge/ --gcc_compile_options -DSIM --gcc_compile_options -DFB_MODULE=fb_axi_vip --gcc_compile_options -DTB_MODULE={self.TB_MODULE}').returncode == 0
-            assert subprocess.run(cwd="build", shell=True, args=fr'{SIM_PATH}xvlog -sv -f ../sources.txt -i ../  -i {self.MODULE_DIR}/rtl/').returncode == 0
+            assert subprocess.run(cwd="build", shell=True, args=fr'{SIM_PATH}xvlog -sv -f ../sources.txt -i ../').returncode == 0
             assert subprocess.run(cwd="build", shell=True, args=fr'{SIM_PATH}xelab {self.TB_MODULE} --snapshot {self.TB_MODULE} -log elaborate.log --debug typical -sv_lib dpi').returncode == 0
 
         if SIM == 'icarus':
@@ -237,7 +265,6 @@ set CONFIG_BASEADDR    0x{self.CONFIG_BASEADDR}
                 f'--top {self.TB_MODULE}',
 
                 f'-I../',
-                f'-I{self.MODULE_DIR}/rtl/',
                 f'-F ../sources.txt',
                 f'--Mdir ./ ',
                 
@@ -247,13 +274,13 @@ set CONFIG_BASEADDR    0x{self.CONFIG_BASEADDR}
                 f'-CFLAGS -I../',
                 f'-CFLAGS -I{self.MODULE_DIR}/firebridge/',
                 f'-CFLAGS -g',
+
                 
                 f'{self.MODULE_DIR}/c/sim.c',
                 f'{self.MODULE_DIR}/firebridge/fb_top_verilator_wrap.cpp',
                 
                 '--Wno-INITIALDLY',
                 '--Wno-BLKANDNBLK',
-                '--Wno-UNOPTFLAT'
             ]
             cmd = ' '.join(cmd)
             print(cmd)

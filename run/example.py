@@ -158,7 +158,7 @@ hw = Hardware (                          # Alternatively: hw = Hardware.from_jso
         bits_weights        = 4        , # bit width of weights
         bits_sum            = 20       , # bit width of accumulator
         bits_bias           = 16       , # bit width of bias
-        max_batch_size      = 64       , # 
+        max_batch_size      = 32      , # 
         max_channels_in     = 512      , #
         max_kernel_size     = 9        , #
         max_image_size      = 512      , #
