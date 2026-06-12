@@ -219,7 +219,7 @@ module writeback #(
 
   wire signed [WIDTH-1:0] ch_quot = h_q;
   wire signed [WIDTH-1:0] cw_quot = w_q;
-  wire conv_stride_invalid = (h_r != 0) || (w_r != 0);
+  wire conv_stride_invalid = ((h_r != 0) || (w_r != 0)) && (!hold_invalid);
   // ============================================================================
 
   
@@ -327,12 +327,34 @@ module writeback #(
   wire last_wkw2_now = (i_wkw2 == ram_max_wkw2);  
   wire [WIDTH-1:0] w_last_hw = last_wkw2_now ? ((ram_kw >> 1) + 32'd1) : 32'd1;
 
-  wire [WIDTH-1:0] iyn = i_n                    ;
-  wire [WIDTH-1:0] iyh = il_dot_pe + i_ir       ;
-  wire [WIDTH-1:0] iyw = i_wkw2 + i_iw_last     ;
-  wire [WIDTH-1:0] iyc = ram_coe * i_t + i_icoe;
-  wire [WIDTH-1:0] iy_nhwc_hw = ((iyn * ram_h + iyh) * ram_w + iyw) * ram_co + iyc;
-  wire [WIDTH-1:0] iy_nhwc_conv = (((iyn * ram_ch + ch_quot) * ram_cw + cw_quot) * ram_co) + iyc;
+
+  logic [WIDTH-1:0] hw_co_q;     
+  logic [WIDTH-1:0] w_co_q; 
+  logic [WIDTH-1:0] chw_co_q;   
+  logic [WIDTH-1:0] cw_co_q;     
+  logic [WIDTH-1:0] co_q;     
+  logic [WIDTH-1:0] coe_t_q;
+
+
+  logic [WIDTH-1:0] hw_q, chw_q;
+  always_ff @(posedge clk) begin
+    hw_q     <= ram_h  * ram_w;       
+    hw_co_q  <= hw_q   * ram_co;      
+    chw_q    <= ram_ch * ram_cw;
+    chw_co_q <= chw_q  * ram_co;
+    w_co_q   <= ram_w  * ram_co;
+    cw_co_q  <= ram_cw * ram_co;
+    co_q     <= ram_co;
+    coe_t_q  <= ram_coe * i_t;
+  end     
+
+
+  wire [WIDTH-1:0] iyn = i_n                ;
+  wire [WIDTH-1:0] iyh = il_dot_pe + i_ir   ;
+  wire [WIDTH-1:0] iyw = i_wkw2 + i_iw_last ;
+  wire [WIDTH-1:0] iyc = coe_t_q + i_icoe;
+  wire [WIDTH-1:0] iy_nhwc_hw = iyn * hw_co_q + iyh * w_co_q + iyw * co_q + iyc;          
+  wire [WIDTH-1:0] iy_nhwc_conv = iyn * chw_co_q + ch_quot * cw_co_q + cw_quot * co_q + iyc;              
 
 
 
@@ -383,7 +405,7 @@ module writeback #(
   wire [AXI_DATA_WIDTH-1:0] il_dot_pe = i_l * ram_PE_ROWS;
 
   wire en_counter_rest = pixel_invalid || addr_enable_counter || en_counter_acc || conv_stride_invalid;
-  wire pixel_invalid = (iyh >= ram_h) | (iyc >= ram_co);
+  wire pixel_invalid = ((iyh >= ram_h) | (iyc >= ram_co)) && (!hold_invalid);
   wire en_counter_last = (!rst_inner_rest) & (en_counter_rest);
 
 
@@ -405,7 +427,7 @@ module writeback #(
   n_delay #(.W(1), .N(1)) P_PASS_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_delay));
 
   logic en_counter_hold_invalid;
-  n_delay #(.W(1), .N(2)) HOLD_INVALID_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_hold_invalid));
+  n_delay #(.W(1), .N(3)) HOLD_INVALID_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_hold_invalid));
 
   logic all_done_now; //all done signal for firmware
   assign all_done_now = l_b && l_p && l_t && l_n && l_l && l_wkw2;
@@ -413,7 +435,7 @@ module writeback #(
   logic clear_invalid;
 
   wire [WIDTH-1:0] i_bias; 
-  assign i_bias = ram_coe * i_t + ram_b_offset + i_icoe;
+  assign i_bias = coe_t_q + ram_b_offset + i_icoe;
 
 
   always_ff @(posedge clk) // All cfg written in this always block
