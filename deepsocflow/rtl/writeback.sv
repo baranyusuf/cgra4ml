@@ -100,6 +100,8 @@ module writeback #(
   wire bank_end = l_icoe & l_ir & l_iw_last;
   logic bank_end_increment;
 
+  
+
 
 
   //------------------- RAW VALUE PING-PONG BUFFER (BRAM, wide-write) -----------
@@ -165,6 +167,8 @@ module writeback #(
   wire signed [WIDTH-1:0] s_csw_shift = $signed(ram_csw_shift);
   wire signed [WIDTH-1:0] s_pe_rows   = $signed(ram_PE_ROWS);
   localparam signed [WIDTH-1:0] ONE = $signed(WIDTH'(1));
+  wire signed [WIDTH-1:0] s_pe_div = $signed(ram_pe_div);
+  wire signed [WIDTH-1:0] s_pe_mod = $signed(ram_pe_mod);
 
   logic signed [WIDTH-1:0] bh_q, bh_r, bw_q, bw_r;       
   logic signed [WIDTH-1:0] nbh_q, nbh_r, nbw_q, nbw_r;     
@@ -223,6 +227,8 @@ module writeback #(
   // ============================================================================
 
   
+
+  
   //------------------- NHWC ACCUMULATOR MEMORY (BRAM, proven SDP template) -----
 
     logic [NHWC_ADDR_W-1:0] nhwc_wr_addr;
@@ -263,7 +269,7 @@ module writeback #(
 
 
   logic acc_pass;
-  wire  acc_pass_last = acc_pass && wb_a_done_write_any && (~pixel_invalid) && (!hold_invalid);
+  wire  acc_pass_last = acc_pass && wb_a_done_write_any && (~pixel_invalid) && (!hold_invalid) && (!addr_en_counter_hold);
 
 
   always_ff @(posedge clk) begin
@@ -321,11 +327,21 @@ module writeback #(
   logic             lc_wkw2     , lc_l     , lc_n     , lc_t     , lc_p     , lc_b;
   logic             l_wkw2      , l_l      , l_n      , l_t      , l_p      , l_b ;
 
-  localparam ACTUAL_READ_WIDTH = 18 * WIDTH;
+  logic [WIDTH-1:0] ram_pe_div  , ram_pe_mod;
+
+  localparam ACTUAL_READ_WIDTH = 20 * WIDTH;
   assign ram_rd_addr = SRAM_RD_ADDR_WIDTH'(i_b);
-  assign {ram_cw, ram_ch, ram_csw_shift, ram_csw, ram_csh_shift, ram_csh, ram_co, ram_w, ram_h, ram_b_offset, ram_kw, ram_PE_ROWS, ram_coe, ram_max_wkw2, ram_max_l, ram_max_n, ram_max_t, ram_max_p} = ram_rd_data[ACTUAL_READ_WIDTH-1:0];
   wire last_wkw2_now = (i_wkw2 == ram_max_wkw2);  
   wire [WIDTH-1:0] w_last_hw = last_wkw2_now ? ((ram_kw >> 1) + 32'd1) : 32'd1;
+
+  logic [SRAM_RD_DATA_WIDTH-1:0] ram_rd_data_q;
+  always_ff @(posedge clk) ram_rd_data_q <= ram_rd_data; 
+
+  assign {ram_pe_mod, ram_pe_div,
+          ram_cw, ram_ch, ram_csw_shift, ram_csw, ram_csh_shift, ram_csh, ram_co,
+          ram_w, ram_h, ram_b_offset, ram_kw, ram_PE_ROWS, ram_coe,
+          ram_max_wkw2, ram_max_l, ram_max_n, ram_max_t, ram_max_p}
+        = ram_rd_data_q[ACTUAL_READ_WIDTH-1:0];
 
 
   logic [WIDTH-1:0] hw_co_q;     
@@ -349,19 +365,77 @@ module writeback #(
   end     
 
 
-  wire [WIDTH-1:0] iyn = i_n                ;
-  wire [WIDTH-1:0] iyh = il_dot_pe + i_ir   ;
-  wire [WIDTH-1:0] iyw = i_wkw2 + i_iw_last ;
+  wire [WIDTH-1:0] iyn = i_n;
+  wire [WIDTH-1:0] iyh = il_dot_pe + i_ir;
+  wire [WIDTH-1:0] iyw = i_wkw2 + i_iw_last;
   wire [WIDTH-1:0] iyc = coe_t_q + i_icoe;
-  wire [WIDTH-1:0] iy_nhwc_hw = iyn * hw_co_q + iyh * w_co_q + iyw * co_q + iyc;          
-  wire [WIDTH-1:0] iy_nhwc_conv = iyn * chw_co_q + ch_quot * cw_co_q + cw_quot * co_q + iyc;              
+  logic [WIDTH-1:0] iyn_hwco_q;
+  always_ff @(posedge clk) iyn_hwco_q <= iyn * hw_co_q;
+
+  logic [WIDTH-1:0] iyh_wco_q, iyw_co_q, iyc_sum1;
+  always_ff @(posedge clk) begin
+    iyh_wco_q   <= iyh * w_co_q;    
+    iyw_co_q    <= iyw * co_q;     
+    iyc_sum1      <= iyc + iyn_hwco_q;             
+  end
+
+  logic [WIDTH-1:0] iy_nhwc_hw;
+  always_ff @(posedge clk)
+    iy_nhwc_hw <= iyc_sum1 + iyh_wco_q + iyw_co_q;
+
+  logic [WIDTH-1:0] il_dot_pe;
+  always_ff @(posedge clk) il_dot_pe <= i_l * ram_PE_ROWS;
+
+  
+
+  logic signed [WIDTH-1:0] ch_quot_r, cw_quot_r;
+  always_ff @(posedge clk) begin
+    ch_quot_r <= ch_quot;
+    cw_quot_r <= cw_quot;
+  end
+
+
+  logic [WIDTH-1:0] cv_m0, cv_m1, cv_m2, cv_iyc0;
+  always_ff @(posedge clk) begin
+    cv_m0   <= iyn       * chw_co_q;   
+    cv_m1   <= ch_quot_r * cw_co_q;    
+    cv_m2   <= cw_quot_r * co_q;       
+    cv_iyc0 <= iyc;
+  end
+
+
+  logic [WIDTH-1:0] cv_s0, cv_s1;
+  always_ff @(posedge clk) begin
+    cv_s0 <= cv_m0 + cv_m1;
+    cv_s1 <= cv_m2 + cv_iyc0;
+  end
+
+  logic [WIDTH-1:0] iy_nhwc_conv;
+  always_ff @(posedge clk)
+    iy_nhwc_conv <= cv_s0 + cv_s1;          
 
 
 
- 
+  // ===================== PIXEL OUTPUT PIPELINE  ========
+  logic [WIDTH-1:0] pack_p, pack2_p, outval_p, iyc_p, iyn_p, ibias_p;
+
+  always_ff @(posedge clk)
+    if (!rstn) begin
+      pack_p<='0; pack2_p<='0; outval_p<='0;
+      iyc_p<='0; iyn_p<='0; ibias_p<='0;
+    end else begin
+      pack_p   <= WIDTH'(WIDTH'(iyn[4:0]) | (WIDTH'(ch_quot[9:0]) << 5) | (WIDTH'(i_bias) << 15));
+      pack2_p  <= WIDTH'(WIDTH'(cw_quot[9:0]) | (WIDTH'(iyc[21:0]) << 10));
+      outval_p <= sum_val;
+      iyc_p    <= iyc;
+      iyn_p    <= iyn;
+      ibias_p  <= i_bias;
+    end
+  // ============================================================================
 
   logic start_increment;
   logic start_increment_2;
+  logic valid_increment;
 
 
   always_ff @(posedge clk)
@@ -372,7 +446,8 @@ module writeback #(
       ram_rd_en    <= lc_p || start; // ib gets updated at the cycle after lc_p
       start_increment <= start;
       start_increment_2 <= start_increment;
-      ram_rd_valid <= ram_rd_en;
+      valid_increment <= ram_rd_en;
+      ram_rd_valid <= valid_increment;
     end
 
   up_counter #(.W(WIDTH)) C_B    (.clk(clk), .rstn_g(rstn), .rst_l(start           ), .en(lc_p    ), .max_in(n_bundles_1 ), .last_clk(lc_b   ), .last(l_b   ), .first(), .count(i_b   ));
@@ -402,11 +477,9 @@ module writeback #(
   wire wb_a_addr_done      = cfg[WB_A_ADDR_DONE][0];
   wire wb_a_done_write_any = cfg[WB_A_DONE_WRITE_ANY][0];
 
-  wire [AXI_DATA_WIDTH-1:0] il_dot_pe = i_l * ram_PE_ROWS;
-
   wire en_counter_rest = pixel_invalid || addr_enable_counter || en_counter_acc || conv_stride_invalid;
   wire pixel_invalid = ((iyh >= ram_h) | (iyc >= ram_co)) && (!hold_invalid);
-  wire en_counter_last = (!rst_inner_rest) & (en_counter_rest);
+  wire en_counter_last = (!rst_inner_rest) && (en_counter_rest) && (!addr_en_counter_hold);
 
 
   up_counter #(.W(WIDTH)) C_IR      (.clk(clk), .rstn_g(rstn), .rst_l(rst_inner), .en(en_counter_last    ),      .max_in(max_ir       ),          .last_clk(lc_ir     ),      .last(l_ir     ),      .first(), .count(i_ir     ));
@@ -427,7 +500,7 @@ module writeback #(
   n_delay #(.W(1), .N(1)) P_PASS_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_delay));
 
   logic en_counter_hold_invalid;
-  n_delay #(.W(1), .N(3)) HOLD_INVALID_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_hold_invalid));
+  n_delay #(.W(1), .N(7)) HOLD_INVALID_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_hold_invalid));
 
   logic all_done_now; //all done signal for firmware
   assign all_done_now = l_b && l_p && l_t && l_n && l_l && l_wkw2;
@@ -436,6 +509,10 @@ module writeback #(
 
   wire [WIDTH-1:0] i_bias; 
   assign i_bias = coe_t_q + ram_b_offset + i_icoe;
+
+  logic addr_en_counter_delay;
+  n_delay #(.W(1), .N(2)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
+  logic addr_en_counter_hold;
 
 
   always_ff @(posedge clk) // All cfg written in this always block
@@ -452,6 +529,11 @@ module writeback #(
       if (en_counter_hold_invalid) 
         hold_invalid <= 0;
   
+      if (en_counter_last) 
+        addr_en_counter_hold <= 1;
+      
+      if (addr_en_counter_delay) 
+        addr_en_counter_hold <= 0;
     
 
       if (en_counter_last || start_increment_2) 
@@ -461,7 +543,7 @@ module writeback #(
         cfg[WB_A_ADDR_EN_COUNTER] <= WIDTH'(0);
       
 
-      if ((wb_a_addr_invalid) && (!en_counter_last) && (!hold_invalid) && (sum_proceed) && (!conv_stride_invalid))
+      if ((wb_a_addr_invalid) && (!en_counter_last) && (!hold_invalid) && (sum_proceed) && (!conv_stride_invalid) && (!addr_en_counter_hold))
         clear_invalid <= 1; 
 
       if (clear_invalid) begin
@@ -481,7 +563,7 @@ module writeback #(
           cfg[WB_A_ALL_DONE] <= WIDTH'(1);
       end
 
-      if((bank_end) && (en_counter_rest)) begin
+      if((bank_end) && (en_counter_last)) begin
         cfg[WB_A_ADDR_DONE] <= 1;
         rst_inner_rest <= 1;
         hold_invalid <= 1;
@@ -490,18 +572,22 @@ module writeback #(
         rst_inner_rest <= 0;
 
 
-      cfg[WB_A_ADDR_IYC    ] <= iyc                                                              ;
-      cfg[WB_A_ADDR_IYN    ] <= iyn                                                              ; 
-      cfg[WB_A_I_BIAS      ] <= i_bias                                                           ;
       cfg[WB_A_DONE_WRITE_ANY] <= WIDTH'(cfg[WB_A_DONE_WRITE_0][0] || cfg[WB_A_DONE_WRITE_1][0]) ;
       cfg[WB_A_ICH_QUOT    ] <= ch_quot                                                          ;
       cfg[WB_A_ICW_QUOT    ] <= cw_quot                                                          ;
-      cfg[WB_A_OUT_VAL_HW  ] <= sum_val                                                          ;
-      cfg[WB_A_IY_NHWC_CONV] <= iy_nhwc_conv                                                     ;
       cfg[WB_A_BUNDLE_STATUS] <= WIDTH'(WIDTH'(cfg[WB_A_DONE_WRITE_0][0] || cfg[WB_A_DONE_WRITE_1][0]) | (WIDTH'(cfg[WB_A_ALL_DONE][0]) << 1));
-      cfg[WB_A_OUT_FLAGS] <= WIDTH'((sum_val & 32'h3FFF_FFFF) | (WIDTH'(cfg[WB_A_ADDR_DONE][0])    << 30) | (WIDTH'(cfg[WB_A_ADDR_INVALID][0]) << 31));
-      cfg[WB_A_PIXEL_PACK] <= WIDTH'(WIDTH'(iyn[4:0]) | (WIDTH'(ch_quot[9:0]) << 5) | (WIDTH'(i_bias) << 15));
-      cfg[WB_A_PIXEL_PACK2] <= WIDTH'(WIDTH'(cw_quot[9:0]) | (WIDTH'(iyc[21:0]) << 10));
+  
+
+      cfg[WB_A_ADDR_IYC    ] <= iyc_p;
+      cfg[WB_A_ADDR_IYN    ] <= iyn_p;
+      cfg[WB_A_I_BIAS      ] <= ibias_p;
+      cfg[WB_A_OUT_VAL_HW  ] <= outval_p;
+      cfg[WB_A_IY_NHWC_CONV] <= iy_nhwc_conv;
+      cfg[WB_A_OUT_FLAGS] <= WIDTH'((outval_p & 32'h3FFF_FFFF) 
+                     | (WIDTH'(cfg[WB_A_ADDR_DONE][0])    << 30) 
+                     | (WIDTH'(cfg[WB_A_ADDR_INVALID][0]) << 31));
+      cfg[WB_A_PIXEL_PACK  ] <= pack_p;
+      cfg[WB_A_PIXEL_PACK2 ] <= pack2_p;
 
       
 

@@ -166,6 +166,8 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
     wb_bundles[ib][15]= bundles[ib].csw_shift;
     wb_bundles[ib][16]= bundles[ib].ch;
     wb_bundles[ib][17]= bundles[ib].cw;
+    wb_bundles[ib][18] = PE_ROWS / bundles[ib].csh;
+    wb_bundles[ib][19] = PE_ROWS % bundles[ib].csh;
   }
   
   int32_t * wb_bundles_p = (p_writeback + 32);
