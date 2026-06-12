@@ -156,6 +156,72 @@ module writeback #(
 
   //------------------- END RAW VALUE BUFFER ------------------------------------
 
+
+
+  // ===================== DIVIDER-FREE STRIDED REDUCTION =======================
+
+  wire signed [WIDTH-1:0] s_csh = $signed(ram_csh), s_csw = $signed(ram_csw);
+  wire signed [WIDTH-1:0] s_csh_shift = $signed(ram_csh_shift);
+  wire signed [WIDTH-1:0] s_csw_shift = $signed(ram_csw_shift);
+  wire signed [WIDTH-1:0] s_pe_rows   = $signed(ram_PE_ROWS);
+  localparam signed [WIDTH-1:0] ONE = $signed(WIDTH'(1));
+
+  logic signed [WIDTH-1:0] bh_q, bh_r, bw_q, bw_r;       
+  logic signed [WIDTH-1:0] nbh_q, nbh_r, nbw_q, nbw_r;     
+
+  always_comb begin
+    nbh_q = bh_q; nbh_r = bh_r;
+    nbw_q = bw_q; nbw_r = bw_r;
+
+    if (ram_rd_valid || (lc_wkw2 && l_l)) begin           
+      nbh_q = (s_csh_shift == 0) ? '0 : -ONE;             
+      nbh_r = (s_csh_shift == 0) ? '0 : (s_csh - s_csh_shift);
+    end else if (lc_wkw2) begin                            
+      if (s_csh == ONE) begin                             
+        nbh_r = '0;  nbh_q = bh_q + s_pe_rows;
+      end else begin
+        nbh_r = bh_r + s_pe_rows;  nbh_q = bh_q;
+        for (int k=0; k<PE_ROWS; k++)
+          if (nbh_r >= s_csh) begin nbh_r -= s_csh; nbh_q += 1; end
+      end
+    end
+
+   
+    if (ram_rd_valid || (en_count && l_wkw2)) begin     
+      nbw_q = (s_csw_shift == 0) ? '0 : -ONE;
+      nbw_r = (s_csw_shift == 0) ? '0 : (s_csw - s_csw_shift);
+    end else if (en_count) begin                          
+      if (bw_r + ONE == s_csw) begin nbw_r = '0;        nbw_q = bw_q + 1; end
+      else                     begin nbw_r = bw_r + ONE; nbw_q = bw_q;     end
+    end
+  end
+
+  always_ff @(posedge clk)
+    if (!rstn) begin bh_q<='0; bh_r<='0; bw_q<='0; bw_r<='0; end
+    else      begin bh_q<=nbh_q; bh_r<=nbh_r; bw_q<=nbw_q; bw_r<=nbw_r; end
+
+  logic signed [WIDTH-1:0] h_q, h_r, w_q, w_r;
+  always_comb begin
+    if (s_csh == ONE) begin h_q = bh_q + $signed(i_ir); h_r = '0; end
+    else begin
+      h_r = bh_r + $signed(i_ir);  h_q = bh_q;
+      for (int k=0; k<PE_ROWS; k++)
+        if (h_r >= s_csh) begin h_r -= s_csh; h_q += 1; end
+    end
+
+    if (s_csw == ONE) begin w_q = bw_q + $signed(i_iw_last); w_r = '0; end
+    else begin
+      w_r = bw_r + $signed(i_iw_last);  w_q = bw_q;
+      for (int k=0; k<(KW_MAX/2+1); k++)
+        if (w_r >= s_csw) begin w_r -= s_csw; w_q += 1; end
+    end
+  end
+
+  wire signed [WIDTH-1:0] ch_quot = h_q;
+  wire signed [WIDTH-1:0] cw_quot = w_q;
+  wire conv_stride_invalid = (h_r != 0) || (w_r != 0);
+  // ============================================================================
+
   
   //------------------- NHWC ACCUMULATOR MEMORY (BRAM, proven SDP template) -----
 
@@ -269,13 +335,8 @@ module writeback #(
   wire [WIDTH-1:0] iy_nhwc_conv = (((iyn * ram_ch + ch_quot) * ram_cw + cw_quot) * ram_co) + iyc;
 
 
-  wire signed [WIDTH-1:0] ch_num  = $signed(iyh) - $signed(ram_csh_shift);
-  wire signed [WIDTH-1:0] cw_num  = $signed(iyw) - $signed(ram_csw_shift);
-  wire signed [WIDTH-1:0] ch_quot = ch_num / $signed(ram_csh);
-  wire signed [WIDTH-1:0] ch_rem  = ch_num % $signed(ram_csh);
-  wire signed [WIDTH-1:0] cw_quot = cw_num / $signed(ram_csw);
-  wire signed [WIDTH-1:0] cw_rem  = cw_num % $signed(ram_csw);
-  wire conv_stride_invalid = (ch_rem != 0) || (cw_rem != 0);
+
+ 
 
   logic start_increment;
   logic start_increment_2;
@@ -409,7 +470,7 @@ module writeback #(
 
       cfg[WB_A_ADDR_IYC    ] <= iyc                                                              ;
       cfg[WB_A_ADDR_IYN    ] <= iyn                                                              ; 
-      cfg[WB_A_I_BIAS      ] <= i_bias                         ;
+      cfg[WB_A_I_BIAS      ] <= i_bias                                                           ;
       cfg[WB_A_DONE_WRITE_ANY] <= WIDTH'(cfg[WB_A_DONE_WRITE_0][0] || cfg[WB_A_DONE_WRITE_1][0]) ;
       cfg[WB_A_ICH_QUOT    ] <= ch_quot                                                          ;
       cfg[WB_A_ICW_QUOT    ] <= cw_quot                                                          ;
