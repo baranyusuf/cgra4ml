@@ -3,6 +3,8 @@
 // to debug: (* mark_debug = "true" *) input  logic reg_wr_en,
 
 `include "defines.svh"
+`include "config_hw.svh"
+
 
 module dma_controller #(
   parameter
