@@ -414,13 +414,17 @@ module writeback #(
   logic [WIDTH-1:0] il_dot_pe;
   always_ff @(posedge clk) il_dot_pe <= i_l * ram_PE_ROWS;
 
-
+  logic signed [WIDTH-1:0] ch_quot_q, cw_quot_q;
+  always_ff @(posedge clk) begin
+    ch_quot_q <= ch_quot;
+    cw_quot_q <= cw_quot;
+  end
 
   logic [WIDTH-1:0] cv_m0, cv_m1, cv_m2, cv_iyc0;
   always_ff @(posedge clk) begin
-    cv_m0   <= iyn       * chw_co_q;   
-    cv_m1   <= ch_quot * cw_co_q;    
-    cv_m2   <= cw_quot * co_q;       
+    cv_m0   <= iyn        * chw_co_q;   
+    cv_m1   <= ch_quot_q  * cw_co_q;    
+    cv_m2   <= cw_quot_q  * co_q;       
     cv_iyc0 <= iyc;
   end
 
