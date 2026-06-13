@@ -143,7 +143,6 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
 
   fb_write_reg32(p_writeback + WB_A_N_BUNDLES_1, N_BUNDLES-1);
   int val = fb_read_reg32(p_writeback + WB_A_N_BUNDLES_1);
-  printf("Num bundles written to writeback reg: %d \n", val);
 
   int32_t wb_bundles [N_BUNDLES][32]; 
   
@@ -324,10 +323,8 @@ extern EXT_C void run(Memory_st *restrict mp) {
 
   static i8 ocm_bank = 0; 
 
-  debug_printf("Starting model_setup()\n");
   model_setup(mp);
 
-  debug_printf("model_setup done\n");
   fb_write_reg32(p_config + A_START, 1); 
   bundle_counter = 0;
   i32 done;
@@ -362,7 +359,6 @@ extern EXT_C void run(Memory_st *restrict mp) {
     while (!((status = fb_read_reg32(p_writeback + WB_A_BUNDLE_STATUS)) & 0x1)) {
     }
     done = (status >> 1) & 0x1;
-    debug_printf("[BUNDLE] : bc=%d ocm_bank=%d\n", bundle_counter, ocm_bank);
     bundle_counter++;
     fb_write_reg32(p_config + A_DONE_WRITE + ocm_bank, 0);
 
@@ -371,7 +367,7 @@ extern EXT_C void run(Memory_st *restrict mp) {
 
 PROCESS_AND_STORE_DONE:
 
-      while ((ov = fb_read_reg32(p_writeback + WB_A_OUT_FLAGS)) & 0x80000000) {  
+      while ((ov = fb_read_reg32(p_writeback + WB_A_OUT_FLAGS)) & 0x80000000) { 
         if (ov & 0x40000000) goto BUNDLE_DONE;                      
       }
       v       = ov & 0x3FFFFFFF;
@@ -555,7 +551,6 @@ PROCESS_AND_STORE_DONE:
   };
   ocm_bank ^= 1;
   } // first while
-  debug_printf("done all bundles!!\n");  
 }
 
 extern EXT_C void print_output (Memory_st *restrict mp) {

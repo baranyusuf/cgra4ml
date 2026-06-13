@@ -216,7 +216,7 @@ WB_A_ICW_QUOT        ,
 WB_A_BUNDLE_STATUS   ,
 WB_A_PIXEL_PACK      ,
 WB_A_OUT_FLAGS       ,
-WB_A_PIXEL_PACK2     ,                                                                                           
+WB_A_PIXEL_PACK2     ,
 ''')
 
         with open('config_hw.tcl', 'w') as f:

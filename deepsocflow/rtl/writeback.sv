@@ -363,7 +363,9 @@ module writeback #(
   wire [WIDTH-1:0] w_last_hw = last_wkw2_now ? ((ram_kw >> 1) + 32'd1) : 32'd1;
 
   logic [SRAM_RD_DATA_WIDTH-1:0] ram_rd_data_q;
-  always_ff @(posedge clk) ram_rd_data_q <= ram_rd_data; 
+  always_ff @(posedge clk)
+    if (!rstn) ram_rd_data_q <= '0;
+    else       ram_rd_data_q <= ram_rd_data; 
 
   assign {ram_pe_mod, ram_pe_div,
           ram_cw, ram_ch, ram_csw_shift, ram_csw, ram_csh_shift, ram_csh, ram_co,
@@ -381,16 +383,20 @@ module writeback #(
 
 
   logic [WIDTH-1:0] hw_q, chw_q;
-  always_ff @(posedge clk) begin
-    hw_q     <= ram_h  * ram_w;       
-    hw_co_q  <= hw_q   * ram_co;      
-    chw_q    <= ram_ch * ram_cw;
-    chw_co_q <= chw_q  * ram_co;
-    w_co_q   <= ram_w  * ram_co;
-    cw_co_q  <= ram_cw * ram_co;
-    co_q     <= ram_co;
-    coe_t_q  <= ram_coe * i_t;
-  end     
+  always_ff @(posedge clk)
+    if (!rstn) begin
+      hw_q <= '0; hw_co_q <= '0; chw_q <= '0; chw_co_q <= '0;
+      w_co_q <= '0; cw_co_q <= '0; co_q <= '0; coe_t_q <= '0;
+    end else begin
+      hw_q     <= ram_h  * ram_w;       
+      hw_co_q  <= hw_q   * ram_co;      
+      chw_q    <= ram_ch * ram_cw;
+      chw_co_q <= chw_q  * ram_co;
+      w_co_q   <= ram_w  * ram_co;
+      cw_co_q  <= ram_cw * ram_co;
+      co_q     <= ram_co;
+      coe_t_q  <= ram_coe * i_t;
+    end     
 
 
   wire [WIDTH-1:0] iyn = i_n;
@@ -398,46 +404,64 @@ module writeback #(
   wire [WIDTH-1:0] iyw = i_wkw2 + i_iw_last;
   wire [WIDTH-1:0] iyc = coe_t_q + i_icoe;
   logic [WIDTH-1:0] iyn_hwco_q;
-  always_ff @(posedge clk) iyn_hwco_q <= iyn * hw_co_q;
+  always_ff @(posedge clk)
+    if (!rstn) iyn_hwco_q <= '0;
+    else       iyn_hwco_q <= iyn * hw_co_q;
 
   logic [WIDTH-1:0] iyh_wco_q, iyw_co_q, iyc_sum1;
-  always_ff @(posedge clk) begin
-    iyh_wco_q   <= iyh * w_co_q;    
-    iyw_co_q    <= iyw * co_q;     
-    iyc_sum1      <= iyc + iyn_hwco_q;             
-  end
+  always_ff @(posedge clk)
+    if (!rstn) begin
+      iyh_wco_q <= '0; iyw_co_q <= '0; iyc_sum1 <= '0;
+    end else begin
+      iyh_wco_q   <= iyh * w_co_q;    
+      iyw_co_q    <= iyw * co_q;     
+      iyc_sum1      <= iyc + iyn_hwco_q;             
+    end
 
   logic [WIDTH-1:0] iy_nhwc_hw;
   always_ff @(posedge clk)
-    iy_nhwc_hw <= iyc_sum1 + iyh_wco_q + iyw_co_q;
+    if (!rstn) iy_nhwc_hw <= '0;
+    else       iy_nhwc_hw <= iyc_sum1 + iyh_wco_q + iyw_co_q;
 
   logic [WIDTH-1:0] il_dot_pe;
-  always_ff @(posedge clk) il_dot_pe <= i_l * ram_PE_ROWS;
+  always_ff @(posedge clk)
+    if (!rstn) il_dot_pe <= '0;
+    else       il_dot_pe <= i_l * ram_PE_ROWS;
 
   logic signed [WIDTH-1:0] ch_quot_q, cw_quot_q;
-  always_ff @(posedge clk) begin
-    ch_quot_q <= ch_quot;
-    cw_quot_q <= cw_quot;
-  end
+  always_ff @(posedge clk)
+    if (!rstn) begin
+      ch_quot_q <= '0; cw_quot_q <= '0;
+    end else begin
+      ch_quot_q <= ch_quot;
+      cw_quot_q <= cw_quot;
+    end
 
   logic [WIDTH-1:0] cv_m0, cv_m1, cv_m2, cv_iyc0;
-  always_ff @(posedge clk) begin
-    cv_m0   <= iyn        * chw_co_q;   
-    cv_m1   <= ch_quot_q  * cw_co_q;    
-    cv_m2   <= cw_quot_q  * co_q;       
-    cv_iyc0 <= iyc;
-  end
+  always_ff @(posedge clk)
+    if (!rstn) begin
+      cv_m0 <= '0; cv_m1 <= '0; cv_m2 <= '0; cv_iyc0 <= '0;
+    end else begin
+      cv_m0   <= iyn        * chw_co_q;   
+      cv_m1   <= ch_quot_q  * cw_co_q;    
+      cv_m2   <= cw_quot_q  * co_q;       
+      cv_iyc0 <= iyc;
+    end
 
 
   logic [WIDTH-1:0] cv_s0, cv_s1;
-  always_ff @(posedge clk) begin
-    cv_s0 <= cv_m0 + cv_m1;
-    cv_s1 <= cv_m2 + cv_iyc0;
-  end
+  always_ff @(posedge clk)
+    if (!rstn) begin
+      cv_s0 <= '0; cv_s1 <= '0;
+    end else begin
+      cv_s0 <= cv_m0 + cv_m1;
+      cv_s1 <= cv_m2 + cv_iyc0;
+    end
 
   logic [WIDTH-1:0] iy_nhwc_conv;
   always_ff @(posedge clk)
-    iy_nhwc_conv <= cv_s0 + cv_s1;          
+    if (!rstn) iy_nhwc_conv <= '0;
+    else       iy_nhwc_conv <= cv_s0 + cv_s1;         
 
 
 
@@ -465,8 +489,11 @@ module writeback #(
 
   always_ff @(posedge clk)
     if (!rstn) begin
-      ram_rd_en    <= 0;
-      ram_rd_valid <= 0;
+      ram_rd_en         <= 0;
+      ram_rd_valid      <= 0;
+      start_increment   <= 0;
+      start_increment_2 <= 0;
+      valid_increment   <= 0;
     end else begin
       ram_rd_en    <= lc_p || start; // ib gets updated at the cycle after lc_p
       start_increment <= start;
@@ -542,7 +569,11 @@ module writeback #(
 
   always_ff @(posedge clk) // All cfg written in this always block
       if (!rstn) begin 
-        cfg <= '{default:WIDTH'(0)};
+        cfg                  <= '{default:WIDTH'(0)};
+        hold_invalid         <= 1'b0;
+        addr_en_counter_hold <= 1'b0;
+        rst_inner_rest       <= 1'b0;
+        clear_invalid        <= 1'b0;
       end else begin
 
             
@@ -620,6 +651,7 @@ module writeback #(
     
       if (reg_wr_en && reg_wr_addr < N_REG) // PS has priority in writing to registers
         cfg[reg_wr_addr] <= WIDTH'(reg_wr_data);
+
     end
 
  

@@ -1,15 +1,15 @@
 <!-- https://github.com/abarajithan11/deepsocflow/assets/26372005/113bfd40-cb4a-4940-83f4-d2ef91b47c91 -->
 
-# CGRA4ML: A Framework to Implement Modern Neural Networks for Scientific Edge Computing ![status](https://github.com/abarajithan11/dnn-engine/actions/workflows/verify.yml/badge.svg) 
+# CGRA4ML: A Framework to Implement Modern Neural Networks for Scientific Edge Computing !\[status](https://github.com/abarajithan11/dnn-engine/actions/workflows/verify.yml/badge.svg)
 
 cgra4ml is a Python library that helps researchers build, train, and implement their own deep ML models, such as ResNet CNNs, Autoencoders, and Transformers on FPGAs and custom ASIC.
 
 It takes a lot of effort and expertise to implement highly optimized neural networks on edge platforms. The challenging aspects include:
 
-- Designing an optimal dataflow architecture
-- Building & verifying an accelerator, optimizing for high-frequency
-- Building the System-on-Chip, verifying and optimizing data bottlenecks
-- Writing C firmware to control the accelerator and verify its correctness
+* Designing an optimal dataflow architecture
+* Building \& verifying an accelerator, optimizing for high-frequency
+* Building the System-on-Chip, verifying and optimizing data bottlenecks
+* Writing C firmware to control the accelerator and verify its correctness
 
 Often, after all that work, the models do not meet their expected performance due to memory bottlenecks and sub-optimal hardware implementation.
 
@@ -18,41 +18,44 @@ We present a highly flexible, high-performance accelerator system that can be ad
 <p align="center"> <img src="docs/overview.png" width="800"> </p>
 
 
+
 ## Execution API
+
 ```c
 #define NDEBUG
 #include "platform.h"
-#include "deepsocflow_xilinx.h"
+#include "deepsocflow\\\_xilinx.h"
 
 int main() {
 
-  hardware_setup();
-  xil_printf("Welcome to DeepSoCFlow!\n Store weights, biases & inputs at: %p; \n", &mem.w);
+  hardware\\\_setup();
+  xil\\\_printf("Welcome to DeepSoCFlow!\\\\n Store weights, biases \\\& inputs at: %p; \\\\n", \\\&mem.w);
 
-  model_setup();
-  model_run();    // run model and measure time
+  model\\\_setup();
+  model\\\_run();    // run model and measure time
 
-  // Print: outputs & measured time
-  Xil_DCacheFlushRange((INTPTR)&mem.y, sizeof(mem.y));  // force transfer to DDR, starting addr & length
-  for (int i=0; i<O_WORDS; i++)
-    printf("y[%d]: %f \n", i, (float)mem.y[i]);
-  printf("Done inference! time taken: %.5f ms \n", 1000.0*(float)(time_end-time_start)/COUNTS_PER_SECOND);
+  // Print: outputs \\\& measured time
+  Xil\\\_DCacheFlushRange((INTPTR)\\\&mem.y, sizeof(mem.y));  // force transfer to DDR, starting addr \\\& length
+  for (int i=0; i<O\\\_WORDS; i++)
+    printf("y\\\[%d]: %f \\\\n", i, (float)mem.y\\\[i]);
+  printf("Done inference! time taken: %.5f ms \\\\n", 1000.0\\\*(float)(time\\\_end-time\\\_start)/COUNTS\\\_PER\\\_SECOND);
 
-  hardware_cleanup();
+  hardware\\\_cleanup();
   return 0;
 }
 ```
 
 ## Motivation
 
-[HLS4ML](https://github.com/fastmachinelearning/hls4ml) is an open source python framework that's being widely adopted by the scientific community, to generate FPGA & ASIC implementations of their custom Deep Neural Networks. CERN has taped out chips with DNN compression algorithms to be used in LHC using HLS4ML. However, it is not possible to implement deeper neural networks on HLS4ML since it implements one engine per layer in hardware. This project aims to solve that problem and enhance HLS4ML, by creating a statically & dynamically reconfigurable, AXI-Stream DNN engine.
+[HLS4ML](https://github.com/fastmachinelearning/hls4ml) is an open source python framework that's being widely adopted by the scientific community, to generate FPGA \& ASIC implementations of their custom Deep Neural Networks. CERN has taped out chips with DNN compression algorithms to be used in LHC using HLS4ML. However, it is not possible to implement deeper neural networks on HLS4ML since it implements one engine per layer in hardware. This project aims to solve that problem and enhance HLS4ML, by creating a statically \& dynamically reconfigurable, AXI-Stream DNN engine.
+
 
 
 ## Quick Start
 
 0. You need either [Verilator 5.014+](https://verilator.org/guide/latest/install.html#git-quick-install) or XIlinx Vivado for simulation
-
 1. Clone this repo and install deepsocflow
+
 ```bash
 git clone https://github.com/KastnerRG/cgra4ml
 cd cgra4ml
@@ -60,8 +63,9 @@ pip install .
 ```
 
 2. Run the example
+
 ```bash
-# Edit SIM and SIM_PATH in the file to match your simulator
+# Edit SIM and SIM\\\_PATH in the file to match your simulator
 cd run/work
 python ../example.py
 ```
@@ -69,40 +73,43 @@ python ../example.py
 3. FPGA implementation:
 
 3.1. Generate Bitstream from Vivado:
+
 ```bash
 # Make sure correct fpga board was specified in the above script. Default is ZCU102
 # Open Xilinx Vivado, cd into deepsocflow, and type the following in TCL console
 cd run/work
-source vivado_flow.tcl
+source vivado\\\_flow.tcl
 ```
 
 3.2. Run on a ZYNQ FPGA:
 
-- Open Xilinx Vitis
-- Create an application project, using `.xsa` generated by running the `run/work/vivado_flow.tcl`
-- Right click on application project -> Properties
-  - ARM v8 gcc compiler -> Directories -> Add Include Paths: Add absolute paths of `run/work` and `deepsocflow/c`
-  - ARM v8 gcc compiler -> Optimization -> Optimization most (-O3)
-  - ARM v8 gcc linker -> Libraries -> Add Library: `m` (math library)
-- Build, Connect board & launch debug
-- Add a breakpoint at `model_setup()`. When breakpoint hits, load `run/work/vectors/wbx.bin` to the address printed.
-- Continue - This will run the model and print outputs & execution time
+* Open Xilinx Vitis
+* Create an application project, using `.xsa` generated by running the `run/work/vivado\\\_flow.tcl`
+* Right click on application project -> Properties
 
+  * ARM v8 gcc compiler -> Directories -> Add Include Paths: Add absolute paths of `run/work` and `deepsocflow/c`
+  * ARM v8 gcc compiler -> Optimization -> Optimization most (-O3)
+  * ARM v8 gcc linker -> Libraries -> Add Library: `m` (math library)
+* Copy deepsocflow/firebridge/fb\_fw\_wrap.h to deepsocflow/c folder
+* Build, Connect board \& launch debug
+* Add a breakpoint at `model\\\_setup()`. When breakpoint hits, load `run/work/vectors/wbx.bin` to the address printed.
+* Continue - This will run the model and print outputs \& execution time
 4. Ibex SoC Integration
 
 ```
-make image start enter     # build, start & enter docker container
+make image start enter     # build, start \\\& enter docker container
 # make kill                # kill and delete the container
 
 # Inside the container
-make smoke_ibex            # build, run ibex SoC simulation, verify outputs
+make smoke\\\_ibex            # build, run ibex SoC simulation, verify outputs
 ```
 
-5. ASIC implementation with Cadence Genus & Innovus:
+5. ASIC implementation with Cadence Genus \& Innovus:
+
 ```bash
 # First add your PDK to 'asic/pdk', change paths in the scripts and run:
 cd run/work
-genus -f ../../tcl/asic/run_genus.tcl
+genus -f ../../tcl/asic/run\\\_genus.tcl
 innovus
 source ../../tcl/asic/pnr.tcl
 ```
@@ -110,6 +117,7 @@ source ../../tcl/asic/pnr.tcl
 ## Framework Infrastructure
 
 <p align="center"> <img src="docs/infra.png" width="600"> </p>
+
 
 
 ## Citation
@@ -132,5 +140,6 @@ If you use CGRA4ML in your research, please cite our paper:
 
 ## Team Members
 
-- Aba
-- Zhenghua
+* Aba
+* Zhenghua
+
