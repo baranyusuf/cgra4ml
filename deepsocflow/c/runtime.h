@@ -362,7 +362,7 @@ extern EXT_C void run(Memory_st *restrict mp) {
     while (!((status = fb_read_reg32(p_writeback + WB_A_BUNDLE_STATUS)) & 0x1)) {
     }
     done = (status >> 1) & 0x1;
-    debug_printf("[BUNDLE] bc=%d ocm_bank=%d\n", bundle_counter, ocm_bank);
+    debug_printf("[BUNDLE] : bc=%d ocm_bank=%d\n", bundle_counter, ocm_bank);
     bundle_counter++;
     fb_write_reg32(p_config + A_DONE_WRITE + ocm_bank, 0);
 
