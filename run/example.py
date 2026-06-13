@@ -152,7 +152,7 @@ print(f"Test loss:{score[0]}, Test accuracy:{score[1]}")
 Specify Hardware
 '''
 hw = Hardware (                          # Alternatively: hw = Hardware.from_json('hardware.json')
-        processing_elements = (8, 24)  , # (rows, columns) of multiply-add units
+        processing_elements = (7,96)   , # (rows, columns) of multiply-add units
         frequency_mhz       = 200      , #  
         bits_input          = 4        , # bit width of input pixels and activations
         bits_weights        = 4        , # bit width of weights

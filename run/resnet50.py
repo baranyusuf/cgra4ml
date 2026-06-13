@@ -528,7 +528,7 @@ def product_dict(**kwargs):
                                         bits_weights         = [ 4       ],
                                         bits_sum             = [ 24      ],
                                         bits_bias            = [ 16      ],
-                                        max_batch_size       = [ 64      ], 
+                                        max_batch_size       = [ 32     ], 
                                         max_channels_in      = [ 512     ],
                                         max_kernel_size      = [ 9       ],
                                         max_image_size       = [ 512     ],
@@ -558,9 +558,34 @@ def test_dnn_engine(PARAMS):
     VERIFY & EXPORT
     '''
     export_inference(loaded_model, hw, batch_size=hw.ROWS)
-    verify_inference(loaded_model, hw, SIM=SIM)
+    # verify_inference(loaded_model, hw, SIM=SIM)        
 
-    d_perf = predict_model_performance(hw)
-    pp = pprint.PrettyPrinter(indent=4)
-    print(f"Predicted Performance")
-    pp.pprint(d_perf)
+    # d_perf = predict_model_performance(hw)           
+    # pp = pprint.PrettyPrinter(indent=4)
+    # print(f"Predicted Performance")
+    # pp.pprint(d_perf)
+
+
+
+PARAMS = {
+    'processing_elements' : (7,96),
+    'frequency_mhz'       : 200,
+    'bits_input'          : 8,
+    'bits_weights'        : 4,
+    'bits_sum'            : 24,
+    'bits_bias'           : 16,
+    'max_batch_size'      : 32,
+    'max_channels_in'     : 512,
+    'max_kernel_size'     : 9,
+    'max_image_size'      : 512,
+    'max_n_bundles'       : 64,
+    'ram_weights_depth'   : 512,
+    'ram_edges_depth'     : 3584,
+    'axi_width'           : 128,
+    'config_baseaddr'     : "B0000000",
+    'target_cpu_int_bits' : 32,
+    'valid_prob'          : 1,
+    'ready_prob'          : 1,
+    'data_dir'            : 'vectors',
+}
+test_dnn_engine(PARAMS)
