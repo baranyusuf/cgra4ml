@@ -86,7 +86,7 @@ source vivado_flow.tcl
   - ARM v8 gcc linker -> Libraries -> Add Library: `m` (math library)
 - Copy deepsocflow/firebridge/fb_fw_wrap.h to deepsocflow/c
 - Build, Connect board & launch debug
-- Add a breakpoint at `model_run_timed()`. When breakpoint hits, load `run/work/vectors/wbx.bin` to the address printed.
+- Add a breakpoint at `xil_printf`. When breakpoint hits, load `run/work/vectors/wbx.bin` to the address printed.
 - Continue - This will run the model and print outputs & execution time
 
 4. Ibex SoC Integration
