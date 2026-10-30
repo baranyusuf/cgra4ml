@@ -11,6 +11,7 @@ module writeback #(
     PE_COLS         = 96 ,
     KW_MAX          = 13 ,
     NHWC_WORDS      = 6272 ,  
+    BIAS_WORDS      = 1    ,  // size of local bias RAM (words)
 
   localparam  
     WIDTH              = 32  ,
@@ -22,7 +23,8 @@ module writeback #(
     N_VALS_PER_BEAT    = AXI_WIDTH / Y_OUT_BITS,
     RAW_BUF_DEPTH      = PE_ROWS * PE_COLS * (KW_MAX/2 + 1), 
     RAW_BUF_ADDR_WIDTH = $clog2(RAW_BUF_DEPTH),
-    NHWC_ADDR_W = $clog2(NHWC_WORDS)
+    NHWC_ADDR_W = $clog2(NHWC_WORDS),
+    BIAS_ADDR_W = (BIAS_WORDS > 1) ? $clog2(BIAS_WORDS) : 1
 )(
   input  logic clk,
   input  logic rstn,
@@ -63,6 +65,8 @@ module writeback #(
 
   //------------------- BUNDLES SRAM  ---------------------------------------
 
+  localparam BIAS_BASE = N_REG + SRAM_WR_DEPTH; // bias RAM window starts right after the bundle SRAM window
+
   logic ram_rd_en, ram_wr_en, ram_rd_valid;
   logic [SRAM_RD_ADDR_WIDTH-1:0] ram_rd_addr;
   logic [SRAM_WR_ADDR_WIDTH-1:0] ram_wr_addr;
@@ -89,7 +93,7 @@ module writeback #(
   );
 
   always_comb begin
-    ram_wr_en   = reg_wr_en && (reg_wr_addr >= N_REG);
+    ram_wr_en   = reg_wr_en && (reg_wr_addr >= N_REG) && (reg_wr_addr < BIAS_BASE);
     ram_wr_addr = SRAM_WR_ADDR_WIDTH'(reg_wr_addr - N_REG);
     ram_wr_data = WIDTH'(reg_wr_data);
     // ram_rd_en   = reg_rd_en && (reg_rd_addr >= N_REG); Cannot read from CPU
@@ -356,8 +360,9 @@ module writeback #(
   logic             l_wkw2      , l_l      , l_n      , l_t      , l_p      , l_b ;
 
   logic [WIDTH-1:0] ram_pe_div  , ram_pe_mod;
+  logic [WIDTH-1:0] ram_is_bias , ram_b_val_shift, ram_b_bias_shift;
 
-  localparam ACTUAL_READ_WIDTH = 20 * WIDTH;
+  localparam ACTUAL_READ_WIDTH = 23 * WIDTH;
   assign ram_rd_addr = SRAM_RD_ADDR_WIDTH'(i_b);
   wire last_wkw2_now = (i_wkw2 == ram_max_wkw2);  
   wire [WIDTH-1:0] w_last_hw = last_wkw2_now ? ((ram_kw >> 1) + 32'd1) : 32'd1;
@@ -367,7 +372,8 @@ module writeback #(
     if (!rstn) ram_rd_data_q <= '0;
     else       ram_rd_data_q <= ram_rd_data; 
 
-  assign {ram_pe_mod, ram_pe_div,
+  assign {ram_b_bias_shift, ram_b_val_shift, ram_is_bias,
+          ram_pe_mod, ram_pe_div,
           ram_cw, ram_ch, ram_csw_shift, ram_csw, ram_csh_shift, ram_csh, ram_co,
           ram_w, ram_h, ram_b_offset, ram_kw, ram_PE_ROWS, ram_coe,
           ram_max_wkw2, ram_max_l, ram_max_n, ram_max_t, ram_max_p}
@@ -468,6 +474,37 @@ module writeback #(
   // ===================== PIXEL OUTPUT PIPELINE  ========
   logic [WIDTH-1:0] pack_p, pack2_p, outval_p, iyc_p, iyn_p, ibias_p;
 
+  // ---- BIAS (PL): out = (sum << b_val_shift) + (bias << b_bias_shift), when ram_is_bias ----
+  // bias RAM is filled by the PS over AXI-Lite (window starts at BIAS_BASE). Read address i_bias
+  // is stable well before sum_val, so the RAM read data is ready in time. One extra register
+  // stage (sum_q) keeps the shift+add off the RAM->adder critical path; addr_en_counter_delay
+  // is one cycle longer to cover it.
+  logic                   bias_wr_en;
+  logic [BIAS_ADDR_W-1:0] bias_wr_addr, bias_rd_addr;
+  logic [WIDTH-1:0]       bias_rd_q;
+  always_comb begin
+    bias_wr_en   = reg_wr_en && (reg_wr_addr >= BIAS_BASE);
+    bias_wr_addr = BIAS_ADDR_W'(reg_wr_addr - BIAS_BASE);
+    bias_rd_addr = BIAS_ADDR_W'(i_bias);
+  end
+
+  ram_sdp_simple #(
+    .WIDTH (WIDTH), .DEPTH ((BIAS_WORDS > 0) ? BIAS_WORDS : 1), .ADDRW (BIAS_ADDR_W)
+  ) BIAS_RAM (
+    .clkA (clk), .clkB (clk),
+    .weA  (bias_wr_en), .enaA (bias_wr_en), .addrA (bias_wr_addr), .diA (WIDTH'(reg_wr_data)),
+    .enaB (1'b1), .addrB (bias_rd_addr), .doB (bias_rd_q)
+  );
+
+  logic [WIDTH-1:0] sum_q;
+  always_ff @(posedge clk)
+    if (!rstn) sum_q <= '0;
+    else       sum_q <= sum_val;
+
+  wire signed [WIDTH-1:0] sum_sh  = $signed(sum_q    ) <<< ram_b_val_shift [4:0];
+  wire signed [WIDTH-1:0] bias_sh = $signed(bias_rd_q) <<< ram_b_bias_shift[4:0];
+  wire        [WIDTH-1:0] sum_biased = ram_is_bias[0] ? WIDTH'(sum_sh + bias_sh) : sum_q;
+
   always_ff @(posedge clk)
     if (!rstn) begin
       pack_p<='0; pack2_p<='0; outval_p<='0;
@@ -475,7 +512,7 @@ module writeback #(
     end else begin
       pack_p   <= WIDTH'(WIDTH'(iyn[4:0]) | (WIDTH'(ch_quot[9:0]) << 5) | (WIDTH'(i_bias) << 15));
       pack2_p  <= WIDTH'(WIDTH'(cw_quot[9:0]) | (WIDTH'(iyc[21:0]) << 10));
-      outval_p <= sum_val;
+      outval_p <= sum_biased;
       iyc_p    <= iyc;
       iyn_p    <= iyn;
       ibias_p  <= i_bias;
@@ -563,7 +600,7 @@ module writeback #(
   assign i_bias = coe_t_q + ram_b_offset + i_icoe;
 
   logic addr_en_counter_delay;
-  n_delay #(.W(1), .N(3)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
+  n_delay #(.W(1), .N(4)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
   logic addr_en_counter_hold;
 
 

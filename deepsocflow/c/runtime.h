@@ -144,7 +144,7 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
   fb_write_reg32(p_writeback + WB_A_N_BUNDLES_1, N_BUNDLES-1);
   int val = fb_read_reg32(p_writeback + WB_A_N_BUNDLES_1);
 
-  int32_t wb_bundles [N_BUNDLES][32]; 
+  int32_t wb_bundles [N_BUNDLES][32] = {{0}};
   
   for (int ib = 0; ib < N_BUNDLES; ib++){
     wb_bundles[ib][0]= bundles[ib].p-1;
@@ -167,6 +167,9 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
     wb_bundles[ib][17]= bundles[ib].cw;
     wb_bundles[ib][18] = PE_ROWS / bundles[ib].csh;
     wb_bundles[ib][19] = PE_ROWS % bundles[ib].csh;
+    wb_bundles[ib][20] = bundles[ib].is_bias;  // PL adds bias
+    wb_bundles[ib][21] = bundles[ib].b_val_shift;
+    wb_bundles[ib][22] = bundles[ib].b_bias_shift;
   }
   
   int32_t * wb_bundles_p = (p_writeback + 32);
@@ -175,6 +178,10 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
     fb_write_reg32(wb_bundles_p + i, ((i32*)wb_bundles)[i]);
   }
   
+  // Bias values into the PL bias RAM (index = i_bias = b_offset + channel)
+  for (int i = 0; i < B_WORDS; i++)
+    fb_write_reg32(p_writeback + WB_BIAS_BASE + i, (i32)mp->b[i]);
+
   fb_write_reg32(p_writeback + WB_A_START, 1);
 }
 
@@ -388,10 +395,6 @@ PROCESS_AND_STORE_DONE:
   
      
 
-      // ------ ADD BIAS ------
-      if (pb->is_bias){
-        out_val = (out_val << pb->b_val_shift) + (mp->b[i_bias] << pb->b_bias_shift);
-      }
 
       // ------ CORE ACT ------
       out_val = quant_lrelu(out_val, pb->ca_nzero, pb->ca_shift, pb->ca_pl_scale);

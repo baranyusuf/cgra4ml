@@ -137,7 +137,8 @@ module dma_controller #(
     .PE_ROWS        (`ROWS          ),
     .PE_COLS        (`COLS          ),
     .KW_MAX         (`KW_MAX        ),
-    .NHWC_WORDS     (`NHWC_WORDS    )
+    .NHWC_WORDS     (`NHWC_WORDS    ),
+    .BIAS_WORDS     (`BIAS_WORDS    )
   ) WB (
     .clk        (clk                     ),
     .rstn       (rstn                    ),
@@ -163,7 +164,7 @@ module dma_controller #(
     reg_rd_data    = reg_rd_addr_valid < WORDS_IN_CFG ? cfg[reg_rd_addr_valid] : wb_reg_rd_data;
   end
 
-  assign ram_wr_en   = reg_wr_en && (reg_wr_addr >= 16);
+  assign ram_wr_en   = reg_wr_en && (reg_wr_addr >= 16) && (reg_wr_addr < WORDS_IN_CFG); // writes above WORDS_IN_CFG belong to writeback
   assign ram_wr_addr = SRAM_WR_ADDR_WIDTH'(reg_wr_addr - 16);
   assign ram_wr_data = reg_wr_data;
 
