@@ -361,8 +361,9 @@ module writeback #(
 
   logic [WIDTH-1:0] ram_pe_div  , ram_pe_mod;
   logic [WIDTH-1:0] ram_is_bias , ram_b_val_shift, ram_b_bias_shift;
+  logic [WIDTH-1:0] ram_ca_nzero, ram_ca_shift, ram_ca_pl_scale, ram_clip_min, ram_clip_max;
 
-  localparam ACTUAL_READ_WIDTH = 23 * WIDTH;
+  localparam ACTUAL_READ_WIDTH = 28 * WIDTH;
   assign ram_rd_addr = SRAM_RD_ADDR_WIDTH'(i_b);
   wire last_wkw2_now = (i_wkw2 == ram_max_wkw2);  
   wire [WIDTH-1:0] w_last_hw = last_wkw2_now ? ((ram_kw >> 1) + 32'd1) : 32'd1;
@@ -372,7 +373,8 @@ module writeback #(
     if (!rstn) ram_rd_data_q <= '0;
     else       ram_rd_data_q <= ram_rd_data; 
 
-  assign {ram_b_bias_shift, ram_b_val_shift, ram_is_bias,
+  assign {ram_clip_max, ram_clip_min, ram_ca_pl_scale, ram_ca_shift, ram_ca_nzero,
+          ram_b_bias_shift, ram_b_val_shift, ram_is_bias,
           ram_pe_mod, ram_pe_div,
           ram_cw, ram_ch, ram_csw_shift, ram_csw, ram_csh_shift, ram_csh, ram_co,
           ram_w, ram_h, ram_b_offset, ram_kw, ram_PE_ROWS, ram_coe,
@@ -505,6 +507,38 @@ module writeback #(
   wire signed [WIDTH-1:0] bias_sh = $signed(bias_rd_q) <<< ram_b_bias_shift[4:0];
   wire        [WIDTH-1:0] sum_biased = ram_is_bias[0] ? WIDTH'(sum_sh + bias_sh) : sum_q;
 
+  // ---- CORE ACT (PL): same as quant_lrelu() in runtime.h, split in 4 register stages ----
+  //  1) leaky : x<0 ? (nzero ? x : 0) : x << pl_scale
+  //  2) round : t = x + (shift>0 ? (1<<(shift-1)) - (x>>shift is even) : 0)
+  //  3) shift : t >> shift          (steps 2+3 == round-half-to-even of x / 2^shift)
+  //  4) clip  : clamp to [clip_min, clip_max]  (registered into outval_p)
+  logic signed [WIDTH-1:0] act_lk_q, act_sum_q, act_sh_q;
+
+  wire        [4:0]        act_pl    = ram_ca_pl_scale[4:0];
+  wire        [4:0]        act_sft   = ram_ca_shift   [4:0];
+  wire signed [WIDTH-1:0]  act_in    = $signed(WIDTH'(sum_biased));
+
+  wire signed [WIDTH-1:0]  act_lk_d  = (act_in < 0) ? ((ram_ca_nzero != 0) ? act_in : '0)
+                                                    : (act_in <<< act_pl);
+
+  wire signed [WIDTH-1:0]  act_q     = act_lk_q >>> act_sft;
+  wire signed [WIDTH-1:0]  act_half  = (WIDTH'(1) <<< (act_sft - 5'd1));
+  wire signed [WIDTH-1:0]  act_adj   = (act_sft != 0) ? (act_half - (act_q[0] ? WIDTH'(0) : WIDTH'(1))) : '0;
+
+  wire signed [WIDTH-1:0]  act_min   = $signed(ram_clip_min);
+  wire signed [WIDTH-1:0]  act_max   = $signed(ram_clip_max);
+  wire signed [WIDTH-1:0]  act_clip  = (act_sh_q < act_min) ? act_min :
+                                       (act_sh_q > act_max) ? act_max : act_sh_q;
+
+  always_ff @(posedge clk)
+    if (!rstn) begin
+      act_lk_q <= '0; act_sum_q <= '0; act_sh_q <= '0;
+    end else begin
+      act_lk_q  <= act_lk_d;
+      act_sum_q <= act_lk_q + act_adj;
+      act_sh_q  <= act_sum_q >>> act_sft;
+    end
+
   always_ff @(posedge clk)
     if (!rstn) begin
       pack_p<='0; pack2_p<='0; outval_p<='0;
@@ -512,7 +546,7 @@ module writeback #(
     end else begin
       pack_p   <= WIDTH'(WIDTH'(iyn[4:0]) | (WIDTH'(ch_quot[9:0]) << 5) | (WIDTH'(i_bias) << 15));
       pack2_p  <= WIDTH'(WIDTH'(cw_quot[9:0]) | (WIDTH'(iyc[21:0]) << 10));
-      outval_p <= sum_biased;
+      outval_p <= act_clip;
       iyc_p    <= iyc;
       iyn_p    <= iyn;
       ibias_p  <= i_bias;
@@ -600,7 +634,7 @@ module writeback #(
   assign i_bias = coe_t_q + ram_b_offset + i_icoe;
 
   logic addr_en_counter_delay;
-  n_delay #(.W(1), .N(4)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
+  n_delay #(.W(1), .N(7)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
   logic addr_en_counter_hold;
 
 

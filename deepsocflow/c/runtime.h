@@ -170,6 +170,11 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
     wb_bundles[ib][20] = bundles[ib].is_bias;  // PL adds bias
     wb_bundles[ib][21] = bundles[ib].b_val_shift;
     wb_bundles[ib][22] = bundles[ib].b_bias_shift;
+    wb_bundles[ib][23] = bundles[ib].ca_nzero;      // PL does core activation (quant_lrelu)
+    wb_bundles[ib][24] = bundles[ib].ca_shift;
+    wb_bundles[ib][25] = bundles[ib].ca_pl_scale;
+    wb_bundles[ib][26] = -(1 << (X_BITS - bundles[ib].ca_pl_scale - 1));  // clip min
+    wb_bundles[ib][27] = (1 << (X_BITS - 1)) - 1;                         // clip max
   }
   
   int32_t * wb_bundles_p = (p_writeback + 32);
@@ -394,10 +399,6 @@ PROCESS_AND_STORE_DONE:
       fb_write_reg32(p_writeback + WB_A_ADDR_EN_COUNTER, 1);
   
      
-
-
-      // ------ CORE ACT ------
-      out_val = quant_lrelu(out_val, pb->ca_nzero, pb->ca_shift, pb->ca_pl_scale);
 
       // ------ RESIDUAL ADD ---
 
