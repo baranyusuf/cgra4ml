@@ -266,6 +266,7 @@ def export_inference(model, hw, batch_size=1):
         ch.write(f"#define O_TYPE      {out_type}\n")
         ch.write(f"#define B_WORDS     {b_words}\n")
         ch.write(f"#define WB_BIAS_BASE ({32 + hw.MAX_N_BUNDLES*32})  // word offset of bias RAM inside the writeback register space (32 regs + 32 words per bundle)\n")
+        ch.write(f"#define WB_ADD_BASE  ({32 + hw.MAX_N_BUNDLES*32 + max(b_words, 1)})  // word offset of the residual-add buffer RAM (right after the bias RAM); buffer k element i is at WB_ADD_BASE + k*NHWC_WORDS + i\n")
         ch.write(f"#define AXI_WIDTH   {hw.AXI_WIDTH}\n")
         ch.write(f"#define CONFIG_BASEADDR 0x{hw.CONFIG_BASEADDR}\n")
         ch.write(f'#define DATA_DIR   "../{hw.DATA_DIR}"\n\n')
@@ -344,6 +345,7 @@ def export_inference(model, hw, batch_size=1):
         print(f'Weights, inputs, outputs saved to {hw.DATA_DIR}/ib_ip_it_*.txt')
     hw.RAM_NHWC_DEPTH = nhwc_words_max
     hw.RAM_BIAS_DEPTH = max(b_words, 1)
+    hw.RAM_ADD_DEPTH  = max(len(add_buffer_map) * nhwc_words_max, 1)
     hw.export()  # config_hw.svh'yi gerçek NHWC_WORDS ile tazele
 
 

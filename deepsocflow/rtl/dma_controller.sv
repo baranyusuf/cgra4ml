@@ -138,7 +138,8 @@ module dma_controller #(
     .PE_COLS        (`COLS          ),
     .KW_MAX         (`KW_MAX        ),
     .NHWC_WORDS     (`NHWC_WORDS    ),
-    .BIAS_WORDS     (`BIAS_WORDS    )
+    .BIAS_WORDS     (`BIAS_WORDS    ),
+    .ADD_WORDS      (`ADD_WORDS     )
   ) WB (
     .clk        (clk                     ),
     .rstn       (rstn                    ),

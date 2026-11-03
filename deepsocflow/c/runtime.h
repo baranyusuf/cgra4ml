@@ -59,7 +59,6 @@ typedef struct {
   int8_t  debug_tiled    [O_WORDS_MAX ];
   int32_t debug_nhwc     [NHWC_WORDS  ];
 #endif
-  int8_t  add_buffers    [N_ADD_BUF   ][NHWC_WORDS  ]; // should be last, since N_ADD_BUF can be empty
 } Memory_st;
 
 #define MEM_BASEADDR 0x20000000
@@ -175,6 +174,9 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
     wb_bundles[ib][25] = bundles[ib].ca_pl_scale;
     wb_bundles[ib][26] = -(1 << (X_BITS - bundles[ib].ca_pl_scale - 1));  // clip min
     wb_bundles[ib][27] = (1 << (X_BITS - 1)) - 1;                         // clip max
+    wb_bundles[ib][28] = bundles[ib].add_in_buffer_idx == -1 ? -1 : bundles[ib].add_in_buffer_idx * NHWC_WORDS;  // PL residual add: buffer base (-1 = none)
+    wb_bundles[ib][29] = (bundles[ib].aa_nzero != 0) | ((bundles[ib].aa_shift & 0xFF) << 8) | ((bundles[ib].aa_pl_scale & 0xFF) << 16);
+    wb_bundles[ib][30] = -(1 << (X_BITS - bundles[ib].aa_pl_scale - 1));  // residual-add clip min
   }
   
   int32_t * wb_bundles_p = (p_writeback + 32);
@@ -270,9 +272,9 @@ static inline void tile_write( i32 out_val, i8 *restrict p_out_buffer, i32 ib, B
     return;
   }
 
-  // Store for residual add
+  // Store for residual add (into the PL add RAM)
   if (pb->add_out_buffer_idx != -1)
-    mp->add_buffers[pb->add_out_buffer_idx][iy_nhwc] = (i8)out_val;
+    fb_write_reg32(p_writeback + WB_ADD_BASE + pb->add_out_buffer_idx * NHWC_WORDS + iy_nhwc, (i32)(i8)out_val);
 
   // If output only goes to residual add, early return
   Bundle_t*restrict pb_out;
@@ -347,7 +349,6 @@ extern EXT_C void run(Memory_st *restrict mp) {
   i32 i_yh;
   i32 i_yw;
   i32 i_yc;
-  i32 i_bias;
   i32 yn;
   i32 yc;
   i32 status;
@@ -388,7 +389,6 @@ PROCESS_AND_STORE_DONE:
       pk      = fb_read_reg32(p_writeback + WB_A_PIXEL_PACK);
       i_yn    =  pk         & 0x1F;       
       i_yh    = (pk >> 5)   & 0x3FF;    
-      i_bias  = (pk >> 15)  & 0x1FFFF;
 
       iy_nhwc = fb_read_reg32(p_writeback + WB_A_IY_NHWC_CONV);
 
@@ -399,13 +399,6 @@ PROCESS_AND_STORE_DONE:
       fb_write_reg32(p_writeback + WB_A_ADDR_EN_COUNTER, 1);
   
      
-
-      // ------ RESIDUAL ADD ---
-
-      if (pb->add_in_buffer_idx != -1) {
-        out_val += mp->add_buffers[pb->add_in_buffer_idx][iy_nhwc];
-        out_val = quant_lrelu(out_val, pb->aa_nzero, pb->aa_shift, pb->aa_pl_scale);
-      }
 
       // ------ SOFTMAX ------
 

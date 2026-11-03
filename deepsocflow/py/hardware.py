@@ -100,6 +100,7 @@ class Hardware:
         self.X_PAD_MAX             = int(np.ceil(self.KH_MAX//2))
         self.RAM_NHWC_DEPTH        = 0 
         self.RAM_BIAS_DEPTH        = 0   # set by export_inference() from the model's bias count
+        self.RAM_ADD_DEPTH         = 0   # set by export_inference(): residual-add buffers (bytes) kept in PL
         self.BITS_KW2              = clog2((self.KW_MAX+1)/2)
         self.BITS_KH2              = clog2((self.KH_MAX+1)/2)
         self.BITS_CIN_MAX          = clog2(self.CI_MAX)
@@ -193,7 +194,8 @@ class Hardware:
 `define AXI_MAX_BURST_LEN   {self.AXI_MAX_BURST_LEN  :<10}
 `define CONFIG_BASEADDR     32'h{self.CONFIG_BASEADDR:<10}
 `define NHWC_WORDS          {self.RAM_NHWC_DEPTH     :<10} 
-`define BIAS_WORDS          {self.RAM_BIAS_DEPTH     :<10} 
+`define BIAS_WORDS          {self.RAM_BIAS_DEPTH     :<10}
+`define ADD_WORDS           {self.RAM_ADD_DEPTH      :<10} 
 ''')
 
         with open('config_reg.def', 'w') as f:

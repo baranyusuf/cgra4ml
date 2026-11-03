@@ -12,6 +12,7 @@ module writeback #(
     KW_MAX          = 13 ,
     NHWC_WORDS      = 6272 ,  
     BIAS_WORDS      = 1    ,  // size of local bias RAM (words)
+    ADD_WORDS       = 1    ,  // size of local residual-add RAM (bytes)
 
   localparam  
     WIDTH              = 32  ,
@@ -66,6 +67,8 @@ module writeback #(
   //------------------- BUNDLES SRAM  ---------------------------------------
 
   localparam BIAS_BASE = N_REG + SRAM_WR_DEPTH; // bias RAM window starts right after the bundle SRAM window
+  localparam ADD_BASE  = BIAS_BASE + ((BIAS_WORDS > 0) ? BIAS_WORDS : 1); // residual-add RAM window starts right after the bias RAM
+  localparam ADD_ADDR_W = (ADD_WORDS > 1) ? $clog2(ADD_WORDS) : 1;
 
   logic ram_rd_en, ram_wr_en, ram_rd_valid;
   logic [SRAM_RD_ADDR_WIDTH-1:0] ram_rd_addr;
@@ -362,8 +365,9 @@ module writeback #(
   logic [WIDTH-1:0] ram_pe_div  , ram_pe_mod;
   logic [WIDTH-1:0] ram_is_bias , ram_b_val_shift, ram_b_bias_shift;
   logic [WIDTH-1:0] ram_ca_nzero, ram_ca_shift, ram_ca_pl_scale, ram_clip_min, ram_clip_max;
+  logic [WIDTH-1:0] ram_add_base, ram_aa_pack, ram_aa_clip_min;
 
-  localparam ACTUAL_READ_WIDTH = 28 * WIDTH;
+  localparam ACTUAL_READ_WIDTH = 31 * WIDTH;
   assign ram_rd_addr = SRAM_RD_ADDR_WIDTH'(i_b);
   wire last_wkw2_now = (i_wkw2 == ram_max_wkw2);  
   wire [WIDTH-1:0] w_last_hw = last_wkw2_now ? ((ram_kw >> 1) + 32'd1) : 32'd1;
@@ -373,7 +377,8 @@ module writeback #(
     if (!rstn) ram_rd_data_q <= '0;
     else       ram_rd_data_q <= ram_rd_data; 
 
-  assign {ram_clip_max, ram_clip_min, ram_ca_pl_scale, ram_ca_shift, ram_ca_nzero,
+  assign {ram_aa_clip_min, ram_aa_pack, ram_add_base,
+          ram_clip_max, ram_clip_min, ram_ca_pl_scale, ram_ca_shift, ram_ca_nzero,
           ram_b_bias_shift, ram_b_val_shift, ram_is_bias,
           ram_pe_mod, ram_pe_div,
           ram_cw, ram_ch, ram_csw_shift, ram_csw, ram_csh_shift, ram_csh, ram_co,
@@ -474,7 +479,7 @@ module writeback #(
 
 
   // ===================== PIXEL OUTPUT PIPELINE  ========
-  logic [WIDTH-1:0] pack_p, pack2_p, outval_p, iyc_p, iyn_p, ibias_p;
+  logic [WIDTH-1:0] pack_p, pack2_p, outval_p;
 
   // ---- BIAS (PL): out = (sum << b_val_shift) + (bias << b_bias_shift), when ram_is_bias ----
   // bias RAM is filled by the PS over AXI-Lite (window starts at BIAS_BASE). Read address i_bias
@@ -485,7 +490,7 @@ module writeback #(
   logic [BIAS_ADDR_W-1:0] bias_wr_addr, bias_rd_addr;
   logic [WIDTH-1:0]       bias_rd_q;
   always_comb begin
-    bias_wr_en   = reg_wr_en && (reg_wr_addr >= BIAS_BASE);
+    bias_wr_en   = reg_wr_en && (reg_wr_addr >= BIAS_BASE) && (reg_wr_addr < ADD_BASE);
     bias_wr_addr = BIAS_ADDR_W'(reg_wr_addr - BIAS_BASE);
     bias_rd_addr = BIAS_ADDR_W'(i_bias);
   end
@@ -507,49 +512,64 @@ module writeback #(
   wire signed [WIDTH-1:0] bias_sh = $signed(bias_rd_q) <<< ram_b_bias_shift[4:0];
   wire        [WIDTH-1:0] sum_biased = ram_is_bias[0] ? WIDTH'(sum_sh + bias_sh) : sum_q;
 
-  // ---- CORE ACT (PL): same as quant_lrelu() in runtime.h, split in 4 register stages ----
-  //  1) leaky : x<0 ? (nzero ? x : 0) : x << pl_scale
-  //  2) round : t = x + (shift>0 ? (1<<(shift-1)) - (x>>shift is even) : 0)
-  //  3) shift : t >> shift          (steps 2+3 == round-half-to-even of x / 2^shift)
-  //  4) clip  : clamp to [clip_min, clip_max]  (registered into outval_p)
-  logic signed [WIDTH-1:0] act_lk_q, act_sum_q, act_sh_q;
+  // ---- CORE ACT (PL): quant_lrelu(ca_*) -- see wb_quant_lrelu.sv (4 register stages) ----
+  logic signed [WIDTH-1:0] act1_y;
+  wb_quant_lrelu #(.WIDTH(WIDTH)) CORE_ACT (
+    .clk(clk), .rstn(rstn),
+    .x        ($signed(WIDTH'(sum_biased))),
+    .nzero    (ram_ca_nzero != 0),
+    .shift    (ram_ca_shift   [4:0]),
+    .pl_scale (ram_ca_pl_scale[4:0]),
+    .clip_min ($signed(ram_clip_min)),
+    .clip_max ($signed(ram_clip_max)),
+    .y        (act1_y)
+  );
 
-  wire        [4:0]        act_pl    = ram_ca_pl_scale[4:0];
-  wire        [4:0]        act_sft   = ram_ca_shift   [4:0];
-  wire signed [WIDTH-1:0]  act_in    = $signed(WIDTH'(sum_biased));
+  // ---- RESIDUAL ADD (PL): out = quant_lrelu(act1 + add_buffer[iy_nhwc], aa_*) ----
+  // add RAM (bytes) is filled by the PS over AXI-Lite (window starts at ADD_BASE) with the
+  // outputs of earlier bundles. ram_add_base = buffer_idx*NHWC_WORDS, or -1 when this bundle
+  // has no residual add. Without residual add the value goes through a pass-through
+  // quant_lrelu (nzero=1, shift=0, pl_scale=0, clip = full range), so latency stays constant.
+  logic                   add_wr_en;
+  logic [ADD_ADDR_W-1:0]  add_wr_addr, add_rd_addr;
+  logic [7:0]             add_rd_q;
+  always_comb begin
+    add_wr_en   = reg_wr_en && (reg_wr_addr >= ADD_BASE);
+    add_wr_addr = ADD_ADDR_W'(reg_wr_addr - ADD_BASE);
+    add_rd_addr = ADD_ADDR_W'(ram_add_base + iy_nhwc_conv);
+  end
 
-  wire signed [WIDTH-1:0]  act_lk_d  = (act_in < 0) ? ((ram_ca_nzero != 0) ? act_in : '0)
-                                                    : (act_in <<< act_pl);
+  ram_sdp_simple #(
+    .WIDTH (8), .DEPTH ((ADD_WORDS > 0) ? ADD_WORDS : 1), .ADDRW (ADD_ADDR_W)
+  ) ADD_RAM (
+    .clkA (clk), .clkB (clk),
+    .weA  (add_wr_en), .enaA (add_wr_en), .addrA (add_wr_addr), .diA (reg_wr_data[7:0]),
+    .enaB (1'b1), .addrB (add_rd_addr), .doB (add_rd_q)
+  );
 
-  wire signed [WIDTH-1:0]  act_q     = act_lk_q >>> act_sft;
-  wire signed [WIDTH-1:0]  act_half  = (WIDTH'(1) <<< (act_sft - 5'd1));
-  wire signed [WIDTH-1:0]  act_adj   = (act_sft != 0) ? (act_half - (act_q[0] ? WIDTH'(0) : WIDTH'(1))) : '0;
+  wire                    has_add = !ram_add_base[WIDTH-1];
+  logic signed [WIDTH-1:0] add_q;
+  always_ff @(posedge clk)
+    if (!rstn) add_q <= '0;
+    else       add_q <= act1_y + (has_add ? WIDTH'($signed(add_rd_q)) : '0);
 
-  wire signed [WIDTH-1:0]  act_min   = $signed(ram_clip_min);
-  wire signed [WIDTH-1:0]  act_max   = $signed(ram_clip_max);
-  wire signed [WIDTH-1:0]  act_clip  = (act_sh_q < act_min) ? act_min :
-                                       (act_sh_q > act_max) ? act_max : act_sh_q;
+  wb_quant_lrelu #(.WIDTH(WIDTH)) ADD_ACT (
+    .clk(clk), .rstn(rstn),
+    .x        (add_q),
+    .nzero    (has_add ? ram_aa_pack[0]       : 1'b1),
+    .shift    (has_add ? ram_aa_pack[12:8]    : 5'd0),
+    .pl_scale (has_add ? ram_aa_pack[20:16]   : 5'd0),
+    .clip_min (has_add ? $signed(ram_aa_clip_min) : 32'sh8000_0000),
+    .clip_max (has_add ? $signed(ram_clip_max)    : 32'sh7FFF_FFFF),
+    .y        (outval_p)
+  );
 
   always_ff @(posedge clk)
     if (!rstn) begin
-      act_lk_q <= '0; act_sum_q <= '0; act_sh_q <= '0;
-    end else begin
-      act_lk_q  <= act_lk_d;
-      act_sum_q <= act_lk_q + act_adj;
-      act_sh_q  <= act_sum_q >>> act_sft;
-    end
-
-  always_ff @(posedge clk)
-    if (!rstn) begin
-      pack_p<='0; pack2_p<='0; outval_p<='0;
-      iyc_p<='0; iyn_p<='0; ibias_p<='0;
+      pack_p<='0; pack2_p<='0;
     end else begin
       pack_p   <= WIDTH'(WIDTH'(iyn[4:0]) | (WIDTH'(ch_quot[9:0]) << 5) | (WIDTH'(i_bias) << 15));
       pack2_p  <= WIDTH'(WIDTH'(cw_quot[9:0]) | (WIDTH'(iyc[21:0]) << 10));
-      outval_p <= act_clip;
-      iyc_p    <= iyc;
-      iyn_p    <= iyn;
-      ibias_p  <= i_bias;
     end
   // ============================================================================
 
@@ -634,7 +654,7 @@ module writeback #(
   assign i_bias = coe_t_q + ram_b_offset + i_icoe;
 
   logic addr_en_counter_delay;
-  n_delay #(.W(1), .N(7)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
+  n_delay #(.W(1), .N(12)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
   logic addr_en_counter_hold;
 
 
