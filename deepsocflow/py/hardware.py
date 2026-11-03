@@ -101,6 +101,7 @@ class Hardware:
         self.RAM_NHWC_DEPTH        = 0 
         self.RAM_BIAS_DEPTH        = 0   # set by export_inference() from the model's bias count
         self.RAM_ADD_DEPTH         = 0   # set by export_inference(): residual-add buffers (bytes) kept in PL
+        self.RAM_SOFTMAX_DEPTH     = 0   # set by export_inference(): output words of the softmax bundle (logit / probability RAMs in PL)
         self.BITS_KW2              = clog2((self.KW_MAX+1)/2)
         self.BITS_KH2              = clog2((self.KH_MAX+1)/2)
         self.BITS_CIN_MAX          = clog2(self.CI_MAX)
@@ -196,6 +197,7 @@ class Hardware:
 `define NHWC_WORDS          {self.RAM_NHWC_DEPTH     :<10} 
 `define BIAS_WORDS          {self.RAM_BIAS_DEPTH     :<10}
 `define ADD_WORDS           {self.RAM_ADD_DEPTH      :<10} 
+`define SOFTMAX_WORDS       {self.RAM_SOFTMAX_DEPTH  :<10}
 ''')
 
         with open('config_reg.def', 'w') as f:
@@ -221,6 +223,7 @@ WB_A_BUNDLE_STATUS   ,
 WB_A_PIXEL_PACK      ,
 WB_A_OUT_FLAGS       ,
 WB_A_PIXEL_PACK2     ,
+WB_A_SM_STATUS       ,
 ''')
 
         with open('config_hw.tcl', 'w') as f:

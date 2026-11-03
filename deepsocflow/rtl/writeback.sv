@@ -13,6 +13,7 @@ module writeback #(
     NHWC_WORDS      = 6272 ,  
     BIAS_WORDS      = 1    ,  // size of local bias RAM (words)
     ADD_WORDS       = 1    ,  // size of local residual-add RAM (bytes)
+    SM_WORDS        = 1    ,  // output words of the softmax bundle (logit / probability RAM)
 
   localparam  
     WIDTH              = 32  ,
@@ -25,7 +26,8 @@ module writeback #(
     RAW_BUF_DEPTH      = PE_ROWS * PE_COLS * (KW_MAX/2 + 1), 
     RAW_BUF_ADDR_WIDTH = $clog2(RAW_BUF_DEPTH),
     NHWC_ADDR_W = $clog2(NHWC_WORDS),
-    BIAS_ADDR_W = (BIAS_WORDS > 1) ? $clog2(BIAS_WORDS) : 1
+    BIAS_ADDR_W = (BIAS_WORDS > 1) ? $clog2(BIAS_WORDS) : 1,
+    SM_ADDR_W   = (SM_WORDS > 1) ? $clog2(SM_WORDS) : 1
 )(
   input  logic clk,
   input  logic rstn,
@@ -69,8 +71,11 @@ module writeback #(
   localparam BIAS_BASE = N_REG + SRAM_WR_DEPTH; // bias RAM window starts right after the bundle SRAM window
   localparam ADD_BASE  = BIAS_BASE + ((BIAS_WORDS > 0) ? BIAS_WORDS : 1); // residual-add RAM window starts right after the bias RAM
   localparam ADD_ADDR_W = (ADD_WORDS > 1) ? $clog2(ADD_WORDS) : 1;
+  localparam SM_TAB_BASE  = ADD_BASE + ((ADD_WORDS > 0) ? ADD_WORDS : 1); // softmax exp table window (256 words)
+  localparam SM_PROB_BASE = SM_TAB_BASE + 256;                          // softmax probability window (SM_WORDS words)
 
   logic ram_rd_en, ram_wr_en, ram_rd_valid;
+  logic [WIDTH-1:0] sm_prob_rd_data; // from the softmax unit
   logic [SRAM_RD_ADDR_WIDTH-1:0] ram_rd_addr;
   logic [SRAM_WR_ADDR_WIDTH-1:0] ram_wr_addr;
   logic [WIDTH             -1:0] ram_wr_data;
@@ -100,7 +105,9 @@ module writeback #(
     ram_wr_addr = SRAM_WR_ADDR_WIDTH'(reg_wr_addr - N_REG);
     ram_wr_data = WIDTH'(reg_wr_data);
     // ram_rd_en   = reg_rd_en && (reg_rd_addr >= N_REG); Cannot read from CPU
-    reg_rd_data = AXI_DATA_WIDTH'(cfg[reg_rd_addr]);
+    // The AXI-Lite master holds reg_rd_addr until the read is acknowledged, so the 1-clock BRAM read of the probability RAM is valid in time
+    if (reg_rd_addr >= SM_PROB_BASE) reg_rd_data = AXI_DATA_WIDTH'(sm_prob_rd_data);
+    else                             reg_rd_data = AXI_DATA_WIDTH'(cfg[reg_rd_addr[$clog2(N_REG)-1:0]]);
   end
 
 
@@ -365,9 +372,10 @@ module writeback #(
   logic [WIDTH-1:0] ram_pe_div  , ram_pe_mod;
   logic [WIDTH-1:0] ram_is_bias , ram_b_val_shift, ram_b_bias_shift;
   logic [WIDTH-1:0] ram_ca_nzero, ram_ca_shift, ram_ca_pl_scale, ram_clip_min, ram_clip_max;
-  logic [WIDTH-1:0] ram_add_base, ram_aa_pack, ram_aa_clip_min;
+  logic [WIDTH-1:0] ram_add_base, ram_aa_pack, ram_aa_clip_min, ram_add_shifts;
+  wire              ram_is_softmax = ram_add_shifts[16]; // bundle word 31 bit 16: this bundle's outputs go through the PL softmax
 
-  localparam ACTUAL_READ_WIDTH = 31 * WIDTH;
+  localparam ACTUAL_READ_WIDTH = 32 * WIDTH;
   assign ram_rd_addr = SRAM_RD_ADDR_WIDTH'(i_b);
   wire last_wkw2_now = (i_wkw2 == ram_max_wkw2);  
   wire [WIDTH-1:0] w_last_hw = last_wkw2_now ? ((ram_kw >> 1) + 32'd1) : 32'd1;
@@ -377,7 +385,7 @@ module writeback #(
     if (!rstn) ram_rd_data_q <= '0;
     else       ram_rd_data_q <= ram_rd_data; 
 
-  assign {ram_aa_clip_min, ram_aa_pack, ram_add_base,
+  assign {ram_add_shifts, ram_aa_clip_min, ram_aa_pack, ram_add_base,
           ram_clip_max, ram_clip_min, ram_ca_pl_scale, ram_ca_shift, ram_ca_nzero,
           ram_b_bias_shift, ram_b_val_shift, ram_is_bias,
           ram_pe_mod, ram_pe_div,
@@ -534,7 +542,7 @@ module writeback #(
   logic [ADD_ADDR_W-1:0]  add_wr_addr, add_rd_addr;
   logic [7:0]             add_rd_q;
   always_comb begin
-    add_wr_en   = reg_wr_en && (reg_wr_addr >= ADD_BASE);
+    add_wr_en   = reg_wr_en && (reg_wr_addr >= ADD_BASE) && (reg_wr_addr < SM_TAB_BASE);
     add_wr_addr = ADD_ADDR_W'(reg_wr_addr - ADD_BASE);
     add_rd_addr = ADD_ADDR_W'(ram_add_base + iy_nhwc_conv);
   end
@@ -548,10 +556,19 @@ module writeback #(
   );
 
   wire                    has_add = !ram_add_base[WIDTH-1];
-  logic signed [WIDTH-1:0] add_q;
+  // Align the two operands first (Python: x.add_val_shift(other)): main branch << add_val_shift,
+  // stored branch << add_a_shift. Shift and add are separate register stages for timing.
+  wire [4:0] add_vs = has_add ? ram_add_shifts[4:0]  : 5'd0;
+  wire [4:0] add_as = has_add ? ram_add_shifts[12:8] : 5'd0;
+  logic signed [WIDTH-1:0] add_x_q, add_a_q, add_q;
   always_ff @(posedge clk)
-    if (!rstn) add_q <= '0;
-    else       add_q <= act1_y + (has_add ? WIDTH'($signed(add_rd_q)) : '0);
+    if (!rstn) begin
+      add_x_q <= '0; add_a_q <= '0; add_q <= '0;
+    end else begin
+      add_x_q <= act1_y <<< add_vs;
+      add_a_q <= has_add ? (WIDTH'($signed(add_rd_q)) <<< add_as) : '0;
+      add_q   <= add_x_q + add_a_q;
+    end
 
   wb_quant_lrelu #(.WIDTH(WIDTH)) ADD_ACT (
     .clk(clk), .rstn(rstn),
@@ -562,6 +579,26 @@ module writeback #(
     .clip_min (has_add ? $signed(ram_aa_clip_min) : 32'sh8000_0000),
     .clip_max (has_add ? $signed(ram_clip_max)    : 32'sh7FFF_FFFF),
     .y        (outval_p)
+  );
+
+  // ---- SOFTMAX (PL): see wb_softmax.sv ----
+  // When the PS accepts a pixel (write 1 to WB_A_ADDR_EN_COUNTER), its logit (outval_p, already clipped
+  // to X_BITS) is stored in the softmax unit. outval_p / iy_nhwc_conv / the pixel counters do not move
+  // before that write, so the values seen in the write clock are exactly the ones the PS has just read.
+  // The class with index co-1 is the last one of its pixel -> starts max / exp / sum / divide.
+  // The PS polls WB_A_SM_STATUS (bit0 = busy) and then reads Q24 probabilities from SM_PROB_BASE.
+  wire                   sm_ack     = reg_wr_en && (reg_wr_addr == WB_A_ADDR_EN_COUNTER) && reg_wr_data[0] && ram_is_softmax;
+  wire [21:0]            sm_cls     = pack2_p[31:10];                     // class index (iyc) of the pixel being accepted
+  wire                   sm_last    = (WIDTH'(sm_cls) == ram_co - 1);
+  logic                  sm_busy;
+  wb_softmax #(.WIDTH(WIDTH), .WORDS(SM_WORDS)) SOFTMAX (
+    .clk(clk), .rstn(rstn),
+    .cap_valid(sm_ack), .cap_addr(SM_ADDR_W'(iy_nhwc_conv)), .cap_logit(outval_p[7:0]),
+    .cap_last(sm_last), .cap_ncls(ram_co),
+    .tab_we(reg_wr_en && (reg_wr_addr >= SM_TAB_BASE) && (reg_wr_addr < SM_PROB_BASE)),
+    .tab_addr(8'(reg_wr_addr - SM_TAB_BASE)), .tab_data(WIDTH'(reg_wr_data)),
+    .prob_rd_addr(SM_ADDR_W'(reg_rd_addr - SM_PROB_BASE)), .prob_rd_data(sm_prob_rd_data),
+    .busy(sm_busy)
   );
 
   always_ff @(posedge clk)
@@ -654,7 +691,7 @@ module writeback #(
   assign i_bias = coe_t_q + ram_b_offset + i_icoe;
 
   logic addr_en_counter_delay;
-  n_delay #(.W(1), .N(12)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
+  n_delay #(.W(1), .N(13)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
   logic addr_en_counter_hold;
 
 
@@ -730,6 +767,7 @@ module writeback #(
                      | (WIDTH'(cfg[WB_A_ADDR_INVALID][0]) << 31));
       cfg[WB_A_PIXEL_PACK  ] <= pack_p;
       cfg[WB_A_PIXEL_PACK2 ] <= pack2_p;
+      cfg[WB_A_SM_STATUS   ] <= WIDTH'(sm_busy);
 
       
 

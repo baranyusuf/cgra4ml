@@ -23,9 +23,8 @@ typedef const struct {
   const int32_t   xp_words, b_offset, w_bpt, w_bpt_p0, x_bpt, x_bpt_p0, o_words, o_bytes;
   const int8_t    ib_out, in_buffer_idx, out_buffer_idx, add_out_buffer_idx, add_in_buffer_idx;
   const int8_t    is_bias, is_pool, is_flatten, is_softmax;
-  const int8_t    x_pad, b_val_shift, b_bias_shift, ca_nzero, ca_shift, ca_pl_scale, aa_nzero, aa_shift, aa_pl_scale, pa_nzero, pa_shift, pa_pl_scale, softmax_frac;
+  const int8_t    x_pad, b_val_shift, b_bias_shift, ca_nzero, ca_shift, ca_pl_scale, aa_nzero, aa_shift, aa_pl_scale, add_val_shift, add_a_shift, pa_nzero, pa_shift, pa_pl_scale;
   const int8_t    csh, csh_shift, psh_shift, csw, csw_shift, psw_shift, pool;
-  const int32_t   softmax_max_i;
   const uint64_t  header;
   const int32_t   debug_nhwc_words;
 } Bundle_t;
@@ -177,6 +176,7 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
     wb_bundles[ib][28] = bundles[ib].add_in_buffer_idx == -1 ? -1 : bundles[ib].add_in_buffer_idx * NHWC_WORDS;  // PL residual add: buffer base (-1 = none)
     wb_bundles[ib][29] = (bundles[ib].aa_nzero != 0) | ((bundles[ib].aa_shift & 0xFF) << 8) | ((bundles[ib].aa_pl_scale & 0xFF) << 16);
     wb_bundles[ib][30] = -(1 << (X_BITS - bundles[ib].aa_pl_scale - 1));  // residual-add clip min
+    wb_bundles[ib][31] = (bundles[ib].add_val_shift & 0xFF) | ((bundles[ib].add_a_shift & 0xFF) << 8) | ((bundles[ib].is_softmax != 0) << 16);  // residual-add operand alignment shifts | bit16: PL softmax
   }
   
   int32_t * wb_bundles_p = (p_writeback + 32);
@@ -188,6 +188,10 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
   // Bias values into the PL bias RAM (index = i_bias = b_offset + channel)
   for (int i = 0; i < B_WORDS; i++)
     fb_write_reg32(p_writeback + WB_BIAS_BASE + i, (i32)mp->b[i]);
+
+  // exp table of the PL softmax: tab[d] = exp(-d/2^frac) in Q24 (d = max_logit - logit)
+  for (int i = 0; i < SM_TAB_N; i++)
+    fb_write_reg32(p_writeback + WB_SM_TAB_BASE + i, (i32)sm_tab[i]);
 
   fb_write_reg32(p_writeback + WB_A_START, 1);
 }
@@ -405,22 +409,13 @@ PROCESS_AND_STORE_DONE:
       if (pb->is_softmax) {
         assert_printf (ib , !=, N_BUNDLES, "Softmax is only allowed for the last bundle.", DEBUG_INFO);
 
-        f32__ val = (f32__)out_val;
-        val = val / (f32__)(1 << pb->softmax_frac);
-        val = val - ((f32__)pb->softmax_max_i)/(1 << 17);
-        val = (f32__)exp(val);
-        mp->y[iy_nhwc] = val;
-
+        // The PL has stored this logit (it saw the ack above). On the last class of the pixel it finds the
+        // max, looks up exp(logit-max), sums and divides; probabilities are Q24 fixed point.
         if (i_yc == pb->co-1) {
-          f32__ sum = 0;
-          i32 iy_nhwc;
+          while (fb_read_reg32(p_writeback + WB_A_SM_STATUS) & 1) {}
           for (int i=0; i<pb->co; i++){
-            iy_nhwc = flatten_nhwc(i_yn,i_yh,i_yw,i, yn,yh,yw,yc, "Before softmax sum", DEBUG_INFO);
-            sum += mp->y[iy_nhwc];
-          }
-          for (int i=0; i<pb->co; i++){
-            iy_nhwc = flatten_nhwc(i_yn,i_yh,i_yw,i, yn,yh,yw,yc, "After softmax sum", DEBUG_INFO);
-            mp->y[iy_nhwc] = mp->y[iy_nhwc] / sum;
+            i32 iy = flatten_nhwc(i_yn,i_yh,i_yw,i, yn,yh,yw,yc, "Softmax read", DEBUG_INFO);
+            mp->y[iy] = (f32__)((uint32_t)fb_read_reg32(p_writeback + WB_SM_PROB_BASE + iy)) / (f32__)(1 << SM_FRAC_BITS);
           }
         }
         goto PROCESS_AND_STORE_DONE;
@@ -515,7 +510,7 @@ PROCESS_AND_STORE_DONE:
     sprintf(f_path_tiled, "%s/%0d_y_tiled_sim.txt", DATA_DIR, ib);
     FILE *fp_tiled = fopen(f_path_tiled, "w");
     for (i32 i=0; i<pb->o_words; i++)
-      if (ib == N_BUNDLES-1) sim_fprintf(fp_tiled,"%d\n", (i32)(mp->y[i] * (1 << 17)));
+      if (ib == N_BUNDLES-1) sim_fprintf(fp_tiled,"%d\n", (i32)(mp->y[i] * (1 << Y_DUMP_SHIFT)));
       else sim_fprintf(fp_tiled,"%d\n", mp->debug_tiled[i]);
     fclose(fp_tiled);
 
