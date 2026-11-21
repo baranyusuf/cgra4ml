@@ -26,9 +26,10 @@ class XBundle(Layer):
         if flatten:
             self.flatten.out = XTensor(None, None, float_only=True)
         self.softmax = Activation("softmax") if softmax else None
+        # softmax=True: float probabilities (final output only).  softmax=XActivation(...): probabilities are quantized with it and feed the next bundle
+        self.softmax_act = softmax if (softmax is not True and softmax is not False and hasattr(softmax, 'sys_bits')) else None
 
         self.out = XTensor(None, None, float_only=True)
-        self.softmax_max_i = 0
         self.softmax_frac = 0
 
         self.ib = None
@@ -70,6 +71,8 @@ class XBundle(Layer):
             x = self.flatten(x)
         if self.softmax:
             x = self.softmax(x)
+            if self.softmax_act is not None:
+                x = self.softmax_act(x)
             self.out.ftensor = x
 
         self.out.ftensor = x
@@ -96,19 +99,24 @@ class XBundle(Layer):
             out = XTensor(tensor=out.itensor.numpy().reshape(out.itensor.shape[0],-1), bits=out.bits, frac=out.frac, from_int=True)
             
         if self.softmax:
+            # Golden model: conventional float64 softmax of the real-valued logits (independent of the PL exp table / divider)
             self.pre_softmax = deepcopy(out)
             self.softmax_frac = out.frac
-            softmax_out = out.ftensor.numpy().astype(np.float32)
-            factor = 2**17
-            self.softmax_max_i = int(softmax_out.max()*factor)
-            exp = np.exp(softmax_out - self.softmax_max_i/factor).astype(np.float32)
-            softmax_out = exp/np.sum(exp, axis=1, dtype=np.float32)[0]
+            assert out.frac <= hw.SM_TAB_F, f"softmax_frac {out.frac} must be <= {hw.SM_TAB_F}"
+            L = out.ftensor.numpy().astype(np.float64)
+            ex = np.exp(L - L.max(axis=-1, keepdims=True))
+            p = ex / ex.sum(axis=-1, keepdims=True)
 
-            assert np.all(np.argmax(self.out.ftensor, axis=-1) == np.argmax(softmax_out, axis=-1)), \
-                f"Softmax argmax does not match. \nout:{self.out.ftensor}, \nself.out:{softmax_out}"
-            out.ftensor = tf.convert_to_tensor(softmax_out, dtype=tf.float32) # replace with one calc from int
-            out.from_int = False
-            out.float_only = True
+            ref = self.out.ftensor.numpy()                           # Keras float softmax (quantized if softmax_act)
+            if self.softmax_act is None:
+                assert np.allclose(p, ref, atol=1e-5), f"Softmax mismatch. \nnumpy:{p}, \nkeras:{ref}"
+                out = XTensor(tensor=tf.convert_to_tensor(p, dtype=tf.float32), bits=None, float_only=True)
+            else:
+                o = self.softmax_act.out
+                q = np.clip(np.round(p * 2**o.frac), -2**(o.bits-1), 2**(o.bits-1)-1).astype(int)   # np.round = half-to-even
+                out = XTensor(tensor=q, bits=o.bits, frac=o.frac, from_int=True)
+                assert np.max(np.abs(out.ftensor.numpy() - ref)) <= 2.0**-o.frac + 1e-6, \
+                    f"Quantized softmax differs from Keras by more than 1 LSB. \nnumpy:{out.ftensor.numpy()}, \nkeras:{ref}"
         else:
             assert np.allclose(out.ftensor, self.out.ftensor), \
                 f"Bundle output does not match. \nout:{out.ftensor.numpy().flatten()[:100]}, \nself.out:{self.out.ftensor.numpy().flatten()[:100]}"
@@ -125,12 +133,12 @@ class XBundle(Layer):
             w_int = self.core.w.itensor.numpy().reshape(1,1,CI,CO) # (CI,CO) -> (KH,KW,CI,CO)
             x_int = self.core.x.itensor.numpy().reshape(1,XN,1,CI) # (XN,CI) -> (XN, XH, XW, CI)
             y_int = self.core.y.itensor.numpy().reshape(1,XN,1,CO) # (XN,CI) -> (XN, XH, XW, CI)
-            o_int = (self.pre_softmax if self.softmax else self.out).itensor.numpy().reshape(1,XN,1,CO)
+            o_int = (self.pre_softmax if (self.softmax and self.softmax_act is None) else self.out).itensor.numpy().reshape(1,XN,1,CO)
         else:
             w_int = self.core.w.itensor.numpy()
             x_int = self.core.x.itensor.numpy()
             y_int = self.core.y.itensor.numpy()
-            o_int = (self.pre_softmax if self.softmax else self.out).itensor.numpy()
+            o_int = (self.pre_softmax if (self.softmax and self.softmax_act is None) else self.out).itensor.numpy()
 
         b_int = self.core.b.itensor.numpy() if self.core.b else None
         

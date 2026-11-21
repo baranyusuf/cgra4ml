@@ -1,5 +1,5 @@
 `timescale 1ns/1ps
-// Softmax in the PL, replaces the float exp / sum / divide that the PS did for the last bundle.
+// Softmax in the PL, replaces the float exp / sum / divide that the PS did.
 //
 //  The logits arriving here are the (already clipped) outputs of the last activation, so they fit
 //  in X_BITS <= 8 bits and there are at most 256 different values. For one output pixel with n classes:
@@ -8,7 +8,12 @@
 //    3) e_k = tab[max - logit_k]  (tab[d] = exp(-d / 2^frac) in Q24, filled by the PS; e_max = 1.0)
 //       sum = e_0 + e_1 + ...      (sum >= 1.0, never zero)
 //    4) p_k = floor(e_k * 2^24 / sum)   (Q24 probability, shift-subtract divider)
-//  The PS reads p_k from the probability RAM once busy = 0.
+//  The exp table has the finest resolution (tab[j] = exp(-j/2^TAB_F)). A bundle whose logits have f fractional
+//  bits reads tab[d << (TAB_F - f)], so one table serves every softmax bundle (cap_shift = TAB_F - f); indices past the
+//  end are clamped to the last entry (exp(-17.3) rounds to 0 in Q24).
+//  5) emit: p_k is handed out one class at a time (em_valid / em_data / em_k), the consumer answers each
+//     with em_ack. em_data is the raw Q24 probability, or - when cap_quant is set - p_k rounded
+//     (half to even) to cap_ofrac fractional bits and clipped to em_qmax (input of the next bundle).
 //  Result is mathematically softmax(logits) (shift by max does not change it), no dependence on any
 //  calibration constant.
 module wb_softmax #(
@@ -16,7 +21,9 @@ module wb_softmax #(
   parameter WORDS  = 16,                                  // >= number of output words of the softmax bundle
   parameter ADDR_W = (WORDS > 1) ? $clog2(WORDS) : 1,
   parameter QP     = 24,                                  // fractional bits of probabilities (and of the table)
-  parameter SUM_W  = 48
+  parameter SUM_W  = 48,
+  parameter TAB_N  = 2220,                                // exp table entries (last one is 0)
+  parameter TAB_AW = $clog2(TAB_N)
 )(
   input  logic                 clk,
   input  logic                 rstn,
@@ -27,20 +34,26 @@ module wb_softmax #(
   input  logic [7:0]           cap_logit,   // signed
   input  logic                 cap_last,    // last class of the pixel
   input  logic [WIDTH-1:0]     cap_ncls,    // number of classes of the pixel
+  input  logic [3:0]           cap_shift,   // TAB_F - logit fraction bits of this bundle (0..7)
+  input  logic                 cap_quant,   // 1: emit probabilities rounded to cap_ofrac bits, 0: raw Q24
+  input  logic [3:0]           cap_ofrac,   // fractional bits of the quantized output (<= 7)
+  input  logic [WIDTH-1:0]     em_qmax,     // largest quantized output value, (1 << (X_BITS-1)) - 1
 
   // exp table write (AXI-Lite window)
   input  logic                 tab_we,
-  input  logic [7:0]           tab_addr,
+  input  logic [TAB_AW-1:0]    tab_addr,
   input  logic [WIDTH-1:0]     tab_data,
 
-  // probability read (AXI-Lite window), data valid 1 clock after the address
-  input  logic [ADDR_W-1:0]    prob_rd_addr,
-  output logic [WIDTH-1:0]     prob_rd_data,
+  // result stream: one class at a time, em_valid stays high until em_ack
+  output logic                 em_valid,
+  output logic [WIDTH-1:0]     em_data,
+  output logic [WIDTH-1:0]     em_k,        // class index of em_data
+  input  logic                 em_ack,
 
-  output logic                 busy
+  output logic                 idle         // no pixel is being processed or emitted
 );
 
-  typedef enum logic [3:0] {S_IDLE, S_MAX, S_EXP, S_RD, S_LOAD, S_INT, S_FRAC, S_WR} state_t;
+  typedef enum logic [3:0] {S_IDLE, S_MAX, S_EXP, S_RD, S_LOAD, S_INT, S_FRAC, S_WR, S_ERD, S_EQ, S_EOUT} state_t;
   state_t state;
 
   logic [ADDR_W-1:0]  base;
@@ -57,32 +70,37 @@ module wb_softmax #(
     .enaB(1'b1), .addrB(lg_rd_addr), .doB(lg_q)
   );
 
-  logic [7:0]         tab_rd_addr;
+  logic [TAB_AW-1:0]  tab_rd_addr;
   logic [WIDTH-1:0]   tab_q;
-  ram_sdp_simple #(.WIDTH(WIDTH), .DEPTH(256), .ADDRW(8)) EXP_TABLE (
+  ram_sdp_simple #(.WIDTH(WIDTH), .DEPTH(TAB_N), .ADDRW(TAB_AW)) EXP_TABLE (
     .clkA(clk), .clkB(clk),
     .weA(tab_we), .enaA(tab_we), .addrA(tab_addr), .diA(tab_data),
     .enaB(1'b1), .addrB(tab_rd_addr), .doB(tab_q)
   );
 
   logic               pr_we;
-  logic [ADDR_W-1:0]  pr_wr_addr, pr_rd_addr, fsm_pr_rd_addr;
+  logic [ADDR_W-1:0]  pr_wr_addr, fsm_pr_rd_addr;
   logic [WIDTH-1:0]   pr_wr_data, pr_q;
   ram_sdp_simple #(.WIDTH(WIDTH), .DEPTH(WORDS), .ADDRW(ADDR_W)) PROB_RAM (
     .clkA(clk), .clkB(clk),
     .weA(pr_we), .enaA(pr_we), .addrA(pr_wr_addr), .diA(pr_wr_data),
-    .enaB(1'b1), .addrB(pr_rd_addr), .doB(pr_q)
+    .enaB(1'b1), .addrB(fsm_pr_rd_addr), .doB(pr_q)
   );
-  assign pr_rd_addr   = (state == S_IDLE) ? prob_rd_addr : fsm_pr_rd_addr;
-  assign prob_rd_data = pr_q;
 
-  assign busy = (state != S_IDLE) || (cap_valid && cap_last);
+  assign idle = (state == S_IDLE);
 
   // ---------------- pipeline helpers (S_MAX / S_EXP) ----------------
-  logic               v1, v2;                // read data of LOGIT_RAM / EXP_TABLE is valid in this clock
-  logic [WIDTH-1:0]   a1, a2;                // class index belonging to that data
-  wire  signed [8:0]  dd = $signed({max_l[7], max_l}) - $signed({lg_q[7], lg_q});
-  assign tab_rd_addr = dd[7:0];              // max - logit, 0..255
+  // pipeline of pass 2:  lg_q (v1) -> dd_q = max - logit (v2) -> idx_q = clamp(dd_q << sh) (v3) -> tab_q (v4)
+  logic               v1, v2, v3, v4;        // data of that stage is valid in this clock
+  logic [WIDTH-1:0]   a1, a2, a3, a4;        // class index belonging to that data
+  logic [3:0]         sh_q;                  // latched cap_shift
+  logic               quant_q;               // latched cap_quant
+  logic [3:0]         of_q;                  // latched cap_ofrac
+  logic [7:0]         dd_q;
+  logic [TAB_AW-1:0]  idx_q;
+  wire  signed [8:0]  dd   = $signed({max_l[7], max_l}) - $signed({lg_q[7], lg_q});   // 0..255
+  wire  [14:0]        dsh  = {7'b0, dd_q} << sh_q;
+  assign tab_rd_addr = idx_q;
 
   // ---------------- divider ----------------
   logic [SUM_W:0]     r;
@@ -90,15 +108,24 @@ module wb_softmax #(
   logic [WIDTH-1:0]   cnt;
   wire  [SUM_W:0]     r2 = {r[SUM_W-1:0], 1'b0};
 
+  // quantize p (Q24) to of_q fractional bits: round half to even, clip to em_qmax  (same as shift_round in python)
+  wire [4:0]          qs   = 5'(QP) - 5'(of_q);
+  wire [WIDTH-1:0]    qp   = pr_q;
+  wire [WIDTH-1:0]    qhalf = WIDTH'(1) << (qs - 5'd1);
+  wire [WIDTH-1:0]    qsum = qp + qhalf - WIDTH'(~(qp >> qs) & WIDTH'(1));
+  wire [WIDTH-1:0]    qv   = qsum >> qs;
+  wire [WIDTH-1:0]    emq  = (qv > em_qmax) ? em_qmax : qv;
+  assign em_k = k;
+
   always_comb begin
     lg_rd_addr     = base + ADDR_W'(k);
     fsm_pr_rd_addr = base + ADDR_W'(k);
     pr_we          = 1'b0;
     pr_wr_addr     = '0;
     pr_wr_data     = '0;
-    if (state == S_EXP && v2) begin
+    if (state == S_EXP && v4) begin
       pr_we      = 1'b1;
-      pr_wr_addr = base + ADDR_W'(a2);
+      pr_wr_addr = base + ADDR_W'(a4);
       pr_wr_data = tab_q;
     end
     if (state == S_WR) begin
@@ -112,14 +139,19 @@ module wb_softmax #(
     if (!rstn) begin
       state <= S_IDLE;
       base <= '0; n <= '0; k <= '0; max_l <= -8'sd128; sum <= '0;
-      v1 <= 1'b0; v2 <= 1'b0; a1 <= '0; a2 <= '0;
+      v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0; v4 <= 1'b0; a1 <= '0; a2 <= '0; a3 <= '0; a4 <= '0;
+      sh_q <= '0; dd_q <= '0; idx_q <= '0; quant_q <= 1'b0; of_q <= '0;
+      em_valid <= 1'b0; em_data <= '0;
       r <= '0; q <= '0; cnt <= '0;
     end else begin
       case (state)
 
         S_IDLE: begin
-          v1 <= 1'b0; v2 <= 1'b0;
+          v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0; v4 <= 1'b0;
           if (cap_valid && cap_last) begin
+            sh_q  <= cap_shift;
+            quant_q <= cap_quant;
+            of_q    <= cap_ofrac;
             base  <= cap_addr - ADDR_W'(cap_ncls - 1);
             n     <= cap_ncls;
             k     <= '0;
@@ -145,10 +177,11 @@ module wb_softmax #(
           v1 <= (k < n);
           a1 <= k;
           if (k < n) k <= k + 1;
-          v2 <= v1;
-          a2 <= a1;
-          if (v2) sum <= sum + SUM_W'(tab_q);
-          if (k >= n && !v1 && !v2) begin
+          v2 <= v1;  a2 <= a1;  dd_q  <= dd[7:0];
+          v3 <= v2;  a3 <= a2;  idx_q <= (dsh > 15'(TAB_N-1)) ? TAB_AW'(TAB_N-1) : dsh[TAB_AW-1:0];
+          v4 <= v3;  a4 <= a3;
+          if (v4) sum <= sum + SUM_W'(tab_q);
+          if (k >= n && !v1 && !v2 && !v3 && !v4) begin
             k     <= '0;
             state <= S_RD;
           end
@@ -184,9 +217,24 @@ module wb_softmax #(
         end
 
         S_WR: begin
-          k <= k + 1;
+          if (k + 1 >= n) begin k <= '0; state <= S_ERD; end
+          else            begin k <= k + 1; state <= S_RD; end
+        end
+
+        // ---- pass 4: hand the probabilities out, one class per em_ack ----
+        S_ERD: state <= S_EQ;                           // address k is presented, data arrives next clock
+
+        S_EQ: begin
+          em_data  <= quant_q ? emq : pr_q;
+          em_valid <= 1'b1;
+          state    <= S_EOUT;
+        end
+
+        S_EOUT: if (em_ack) begin
+          em_valid <= 1'b0;
           if (k + 1 >= n) state <= S_IDLE;
-          else            state <= S_RD;
+          else            state <= S_ERD;
+          k <= k + 1;
         end
 
         default: state <= S_IDLE;

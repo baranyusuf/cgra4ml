@@ -140,7 +140,8 @@ module dma_controller #(
     .NHWC_WORDS     (`NHWC_WORDS    ),
     .BIAS_WORDS     (`BIAS_WORDS    ),
     .ADD_WORDS      (`ADD_WORDS     ),
-    .SM_WORDS       (`SOFTMAX_WORDS )
+    .SM_WORDS       (`SOFTMAX_WORDS ),
+    .SM_TAB_N       (`SOFTMAX_TAB_N )
   ) WB (
     .clk        (clk                     ),
     .rstn       (rstn                    ),

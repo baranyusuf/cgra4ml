@@ -14,6 +14,7 @@ module writeback #(
     BIAS_WORDS      = 1    ,  // size of local bias RAM (words)
     ADD_WORDS       = 1    ,  // size of local residual-add RAM (bytes)
     SM_WORDS        = 1    ,  // output words of the softmax bundle (logit / probability RAM)
+    SM_TAB_N        = 2220 ,  // entries of the softmax exp table
 
   localparam  
     WIDTH              = 32  ,
@@ -71,11 +72,10 @@ module writeback #(
   localparam BIAS_BASE = N_REG + SRAM_WR_DEPTH; // bias RAM window starts right after the bundle SRAM window
   localparam ADD_BASE  = BIAS_BASE + ((BIAS_WORDS > 0) ? BIAS_WORDS : 1); // residual-add RAM window starts right after the bias RAM
   localparam ADD_ADDR_W = (ADD_WORDS > 1) ? $clog2(ADD_WORDS) : 1;
-  localparam SM_TAB_BASE  = ADD_BASE + ((ADD_WORDS > 0) ? ADD_WORDS : 1); // softmax exp table window (256 words)
-  localparam SM_PROB_BASE = SM_TAB_BASE + 256;                          // softmax probability window (SM_WORDS words)
+  localparam SM_TAB_BASE  = ADD_BASE + ((ADD_WORDS > 0) ? ADD_WORDS : 1); // softmax exp table window (SM_TAB_N words)
+  localparam SM_TAB_AW    = $clog2(SM_TAB_N);
 
   logic ram_rd_en, ram_wr_en, ram_rd_valid;
-  logic [WIDTH-1:0] sm_prob_rd_data; // from the softmax unit
   logic [SRAM_RD_ADDR_WIDTH-1:0] ram_rd_addr;
   logic [SRAM_WR_ADDR_WIDTH-1:0] ram_wr_addr;
   logic [WIDTH             -1:0] ram_wr_data;
@@ -105,9 +105,7 @@ module writeback #(
     ram_wr_addr = SRAM_WR_ADDR_WIDTH'(reg_wr_addr - N_REG);
     ram_wr_data = WIDTH'(reg_wr_data);
     // ram_rd_en   = reg_rd_en && (reg_rd_addr >= N_REG); Cannot read from CPU
-    // The AXI-Lite master holds reg_rd_addr until the read is acknowledged, so the 1-clock BRAM read of the probability RAM is valid in time
-    if (reg_rd_addr >= SM_PROB_BASE) reg_rd_data = AXI_DATA_WIDTH'(sm_prob_rd_data);
-    else                             reg_rd_data = AXI_DATA_WIDTH'(cfg[reg_rd_addr[$clog2(N_REG)-1:0]]);
+    reg_rd_data = AXI_DATA_WIDTH'(cfg[reg_rd_addr[$clog2(N_REG)-1:0]]);
   end
 
 
@@ -582,23 +580,84 @@ module writeback #(
   );
 
   // ---- SOFTMAX (PL): see wb_softmax.sv ----
-  // When the PS accepts a pixel (write 1 to WB_A_ADDR_EN_COUNTER), its logit (outval_p, already clipped
-  // to X_BITS) is stored in the softmax unit. outval_p / iy_nhwc_conv / the pixel counters do not move
-  // before that write, so the values seen in the write clock are exactly the ones the PS has just read.
-  // The class with index co-1 is the last one of its pixel -> starts max / exp / sum / divide.
-  // The PS polls WB_A_SM_STATUS (bit0 = busy) and then reads Q24 probabilities from SM_PROB_BASE.
-  wire                   sm_ack     = reg_wr_en && (reg_wr_addr == WB_A_ADDR_EN_COUNTER) && reg_wr_data[0] && ram_is_softmax;
-  wire [21:0]            sm_cls     = pack2_p[31:10];                     // class index (iyc) of the pixel being accepted
-  wire                   sm_last    = (WIDTH'(sm_cls) == ram_co - 1);
-  logic                  sm_busy;
-  wb_softmax #(.WIDTH(WIDTH), .WORDS(SM_WORDS)) SOFTMAX (
+  // In a softmax bundle the PS never sees the logits. When a logit pixel becomes valid, the PL accepts it
+  // itself (sm_auto_ack = the ack the PS would have written to WB_A_ADDR_EN_COUNTER) and stores it in the
+  // softmax unit. The class with index co-1 is the last one of its pixel -> starts max / exp / sum / divide.
+  // The result is then presented to the PS like any other output pixel (OUT_FLAGS / PIXEL_PACK / PIXEL_PACK2, one
+  // class per pixel), already rounded to the input format of the next bundle, so the PS just runs tile_write.
+  // New logit pixels are not accepted while the unit is working (the counters simply wait), and the
+  // done flag is hidden until the last result has been taken by the PS.
+  // ---- Pipeline latencies (clocks), counted from en_counter_last (the counters move to the next pixel) ----
+  //  data path of the new pixel:
+  //    raw RAM:   i_sram_addr counter register (1) -> RAW RAM read (1)                      = LAT_ADDR_RD   = 2
+  //    NHWC RAM:  pixel step (i_ir / i_iw_last / i_icoe move):
+  //                 counter register (1) -> iyh_wco_q/iyw_co_q/iyc_sum1 (1) -> iy_nhwc_hw (1) -> NHWC RAM read (1)  = LAT_NHWC_RD   = 4
+  //               bank step (PS writes WB_A_EN_COUNT: i_wkw2 / i_l / i_n / i_t move, and the pixel counters restart):
+  //                 counter register (1) -> il_dot_pe/coe_t_q/iyn_hwco_q (1) -> iyh_wco_q/iyc_sum1 (1) -> iy_nhwc_hw (1)
+  //                 -> NHWC RAM read (1)                                                                          = LAT_NHWC_BANK = 5
+  //               (the last pass of a p>1 layer adds the stored partial sum, so it needs the slower NHWC path)
+  //    sum_val is valid LAT_SUM clocks after the counters moved
+  //  sum_val -> outval_p:  sum_q (1) -> core act (4) -> add align + add (2) -> add act (4)  = LAT_PIPE      = 11
+  //  flag path: the hold ends at +D, then hold visible (1) -> clear_invalid (1) -> cfg[ADDR_INVALID] (1)  = LAT_TAIL = 3
+  //  The value is sampled in the same clock the flag falls, so  LAT_SUM + LAT_PIPE <= D + LAT_TAIL.
+  localparam             LAT_BIAS_REG = 1;
+  localparam             LAT_QL       = 4;                  // wb_quant_lrelu: lk_q, sum_q, sh_q, y
+  localparam             LAT_ADD_REG  = 2;                  // add_x_q / add_a_q, add_q
+  localparam             LAT_PIPE     = LAT_BIAS_REG + LAT_QL + LAT_ADD_REG + LAT_QL;   // = 11
+  localparam             LAT_ADDR_RD  = 2;
+  localparam             LAT_NHWC_RD  = 4;
+  localparam             LAT_NHWC_BANK = 5;
+  localparam             LAT_SUM      = (LAT_NHWC_RD > LAT_ADDR_RD) ? LAT_NHWC_RD : LAT_ADDR_RD;   // = 4
+  localparam             LAT_TAIL     = 3;
+  localparam             EN_CNT_DELAY = LAT_SUM + LAT_PIPE - LAT_TAIL;                  // = 12 (tightest value), after en_counter_last
+  //  After a bank step the flag is released by hold_invalid (HOLD_INV_DELAY clocks after WB_A_EN_COUNT) instead, the same rule:
+  localparam             LAT_SUM_BANK   = (LAT_NHWC_BANK > LAT_ADDR_RD) ? LAT_NHWC_BANK : LAT_ADDR_RD;   // = 5
+  localparam             HOLD_INV_DELAY = LAT_SUM_BANK + LAT_PIPE - LAT_TAIL;       // = 13
+  //  The PS used to wait for the raw bank to be written (BUNDLE_STATUS) before it looked at any pixel. The PL now does the
+  //  same: a pixel is accepted only when the raw bank that is being read has been written completely (DONE_WRITE_x).
+  //  The value is then ready LAT_RAM_WR_RD (RAM write -> read data) + LAT_PIPE clocks after the later of: flag low, bank written.
+  localparam             LAT_RAM_WR_RD = 1;
+  localparam             SM_SETTLE     = LAT_RAM_WR_RD + LAT_PIPE;                       // = 12
+  localparam             SM_VCNT_W     = $clog2(SM_SETTLE + 1) + 1;
+  wire                   sm_bank_written = raw_ocm_bank_rd ? cfg[WB_A_DONE_WRITE_1][0] : cfg[WB_A_DONE_WRITE_0][0];
+  wire                   sm_not_ready  = cfg[WB_A_ADDR_INVALID][0] || !sm_bank_written;
+  logic [SM_VCNT_W-1:0]  sm_vcnt;
+  logic                  sm_arm;
+  logic                  sm_idle, sm_em_valid;
+  logic [WIDTH-1:0]      sm_em_data, sm_em_k;
+  wire                   sm_pix_valid = !sm_not_ready && (sm_vcnt == SM_VCNT_W'(SM_SETTLE)) && !cfg[WB_A_ADDR_DONE][0];   // outval_p has left the pipeline
+  wire                   sm_auto_ack  = ram_is_softmax && sm_arm && sm_pix_valid && sm_idle && !sm_em_valid;
+  wire                   sm_em_ack    = reg_wr_en && (reg_wr_addr == WB_A_ADDR_EN_COUNTER) && reg_wr_data[0] && sm_em_valid;
+  wire [21:0]            sm_cls       = pack2_p[31:10];                     // class index (iyc) of the pixel being accepted
+  // The classes of a pixel arrive in ascending order (iyc = coe_t_q + i_icoe, both counters only count up, tiles t ascend),
+  // so the logit of class co-1 is always the last one of its pixel and the pixel's logits end at its NHWC address.
+  wire                   sm_last      = (WIDTH'(sm_cls) == ram_co - 1);
+  logic [WIDTH-1:0]      sm_em_pack;
+  logic [9:0]            sm_em_w;
+  always_ff @(posedge clk)
+    if (!rstn) begin
+      sm_vcnt <= '0; sm_arm <= 1'b0; sm_em_pack <= '0; sm_em_w <= '0;
+    end else begin
+      if (sm_not_ready)                        sm_vcnt <= '0;
+      else if (sm_vcnt != SM_VCNT_W'(SM_SETTLE)) sm_vcnt <= sm_vcnt + SM_VCNT_W'(1);
+      if (cfg[WB_A_ADDR_INVALID][0]) sm_arm <= 1'b1;   // armed again once the counters have moved on
+      else if (sm_auto_ack)          sm_arm <= 1'b0;   // one ack per pixel
+      if (sm_auto_ack && sm_last) begin                // coordinates of the pixel whose results will be emitted
+        sm_em_pack <= pack_p;
+        sm_em_w    <= pack2_p[9:0];
+      end
+    end
+
+
+  wb_softmax #(.WIDTH(WIDTH), .WORDS(SM_WORDS), .TAB_N(SM_TAB_N)) SOFTMAX (
     .clk(clk), .rstn(rstn),
-    .cap_valid(sm_ack), .cap_addr(SM_ADDR_W'(iy_nhwc_conv)), .cap_logit(outval_p[7:0]),
-    .cap_last(sm_last), .cap_ncls(ram_co),
-    .tab_we(reg_wr_en && (reg_wr_addr >= SM_TAB_BASE) && (reg_wr_addr < SM_PROB_BASE)),
-    .tab_addr(8'(reg_wr_addr - SM_TAB_BASE)), .tab_data(WIDTH'(reg_wr_data)),
-    .prob_rd_addr(SM_ADDR_W'(reg_rd_addr - SM_PROB_BASE)), .prob_rd_data(sm_prob_rd_data),
-    .busy(sm_busy)
+    .cap_valid(sm_auto_ack), .cap_addr(SM_ADDR_W'(iy_nhwc_conv)), .cap_logit(outval_p[7:0]),
+    .cap_last(sm_last), .cap_ncls(ram_co), .cap_shift(ram_add_shifts[23:20]),
+    .cap_quant(ram_add_shifts[17]), .cap_ofrac(ram_add_shifts[27:24]), .em_qmax(ram_clip_max),
+    .tab_we(reg_wr_en && (reg_wr_addr >= SM_TAB_BASE) && (reg_wr_addr < SM_TAB_BASE + SM_TAB_N)),
+    .tab_addr(SM_TAB_AW'(reg_wr_addr - SM_TAB_BASE)), .tab_data(WIDTH'(reg_wr_data)),
+    .em_valid(sm_em_valid), .em_data(sm_em_data), .em_k(sm_em_k), .em_ack(sm_em_ack),
+    .idle(sm_idle)
   );
 
   always_ff @(posedge clk)
@@ -680,10 +739,16 @@ module writeback #(
   n_delay #(.W(1), .N(1)) P_PASS_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_delay));
 
   logic en_counter_hold_invalid;
-  n_delay #(.W(1), .N(7)) HOLD_INVALID_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_hold_invalid));
+  n_delay #(.W(1), .N(HOLD_INV_DELAY)) HOLD_INVALID_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_hold_invalid));
 
   logic all_done_now; //all done signal for firmware
   assign all_done_now = l_b && l_p && l_t && l_n && l_l && l_wkw2;
+
+  // The i_valid_next pulse (I_DELAY clocks after en_count) can come before the next bundle's header is in ram_* (ram_rd_en ->
+  // valid_increment -> ram_rd_valid), so a last bundle whose limits differ from the previous bundle's was judged with the old limits.
+  // The counters restart on ram_rd_valid; the clock after it, the flags are judged with the new limits.
+  logic ram_rd_valid_d;
+  always_ff @(posedge clk) ram_rd_valid_d <= rstn && ram_rd_valid;
 
   logic clear_invalid;
 
@@ -691,7 +756,7 @@ module writeback #(
   assign i_bias = coe_t_q + ram_b_offset + i_icoe;
 
   logic addr_en_counter_delay;
-  n_delay #(.W(1), .N(13)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
+  n_delay #(.W(1), .N(EN_CNT_DELAY)) EN_COUNTER_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_counter_last), .o(addr_en_counter_delay));
   logic addr_en_counter_hold;
 
 
@@ -725,6 +790,9 @@ module writeback #(
 
       if (addr_enable_counter) 
         cfg[WB_A_ADDR_EN_COUNTER] <= WIDTH'(0);
+
+      if (sm_auto_ack)                                   // PL accepts the logit pixel itself
+        cfg[WB_A_ADDR_EN_COUNTER] <= WIDTH'(1);
       
 
       if ((wb_a_addr_invalid) && (!en_counter_last) && (!hold_invalid) && (sum_proceed) && (!conv_stride_invalid) && (!addr_en_counter_hold))
@@ -746,6 +814,8 @@ module writeback #(
         if (all_done_now)
           cfg[WB_A_ALL_DONE] <= WIDTH'(1);
       end
+      if (ram_rd_valid_d && all_done_now)
+        cfg[WB_A_ALL_DONE] <= WIDTH'(1);
 
       if((bank_end) && (en_counter_last)) begin
         cfg[WB_A_ADDR_DONE] <= 1;
@@ -762,12 +832,16 @@ module writeback #(
   
 
       cfg[WB_A_IY_NHWC_CONV] <= iy_nhwc_conv;
-      cfg[WB_A_OUT_FLAGS] <= WIDTH'((outval_p & 32'h3FFF_FFFF) 
+      if (sm_em_valid)                                   // softmax result of one class: valid pixel for the PS
+        cfg[WB_A_OUT_FLAGS] <= WIDTH'(sm_em_data & 32'h3FFF_FFFF);
+      else if (ram_is_softmax)                           // logits are hidden; done only once the softmax unit is idle
+        cfg[WB_A_OUT_FLAGS] <= WIDTH'((WIDTH'(cfg[WB_A_ADDR_DONE][0] && sm_idle) << 30) | (WIDTH'(1) << 31));
+      else
+        cfg[WB_A_OUT_FLAGS] <= WIDTH'((outval_p & 32'h3FFF_FFFF) 
                      | (WIDTH'(cfg[WB_A_ADDR_DONE][0])    << 30) 
                      | (WIDTH'(cfg[WB_A_ADDR_INVALID][0]) << 31));
-      cfg[WB_A_PIXEL_PACK  ] <= pack_p;
-      cfg[WB_A_PIXEL_PACK2 ] <= pack2_p;
-      cfg[WB_A_SM_STATUS   ] <= WIDTH'(sm_busy);
+      cfg[WB_A_PIXEL_PACK  ] <= sm_em_valid ? sm_em_pack : pack_p;
+      cfg[WB_A_PIXEL_PACK2 ] <= sm_em_valid ? (WIDTH'(sm_em_w) | (WIDTH'(sm_em_k[21:0]) << 10)) : pack2_p;
 
       
 
@@ -778,10 +852,39 @@ module writeback #(
  
 
     
-      if (reg_wr_en && reg_wr_addr < N_REG) // PS has priority in writing to registers
+      if (reg_wr_en && reg_wr_addr < N_REG && !(sm_em_valid && reg_wr_addr == WB_A_ADDR_EN_COUNTER)) // PS has priority in writing to registers (its ack of a softmax result must not move the counters)
         cfg[reg_wr_addr] <= WIDTH'(reg_wr_data);
 
     end
 
  
+
+  // ============================================================================
+  // synthesis translate_off
+  // ---- Timing self-check (simulation only) ----
+  // Pixel timing, in clocks after the cycle in which en_counter_last is high (the counters move at its end):
+  //    sum_val is valid at +LAT_SUM, outval_p at +(LAT_SUM + LAT_PIPE), ADDR_INVALID falls at +(EN_CNT_DELAY + LAT_TAIL).
+  // These are equal to the measured worst cases. The property that must hold: once a pixel is taken (the flag fell while its raw
+  // bank was complete, or the softmax unit accepted it) none of the values the PS / softmax unit reads may change until the
+  // counters move again. If a pipeline stage is added or removed without updating the LAT_* constants, this stops the simulation.
+  wire [4*WIDTH-1:0]  chk_val = {outval_p, pack_p, pack2_p, iy_nhwc_conv};
+  logic [4*WIDTH-1:0] chk_val_d;
+  logic               chk_inv_d, chk_open;
+  always @(posedge clk) begin
+    chk_val_d <= chk_val;
+    chk_inv_d <= cfg[WB_A_ADDR_INVALID][0];
+    if (!rstn) chk_open <= 1'b0;
+    else begin
+      if (chk_open && (chk_val != chk_val_d))
+        $fatal(1, "[TIMING] value changed after the pixel was taken: changed fields (outval_p,pack,pack2,iy_nhwc_conv) = %b%b%b%b  out %0d->%0d  (EN_CNT_DELAY=%0d, SM_SETTLE=%0d)",
+               chk_val[3*WIDTH +: WIDTH] != chk_val_d[3*WIDTH +: WIDTH], chk_val[2*WIDTH +: WIDTH] != chk_val_d[2*WIDTH +: WIDTH],
+               chk_val[WIDTH +: WIDTH] != chk_val_d[WIDTH +: WIDTH], chk_val[0 +: WIDTH] != chk_val_d[0 +: WIDTH],
+               $signed(chk_val_d[3*WIDTH +: WIDTH]), $signed(chk_val[3*WIDTH +: WIDTH]), EN_CNT_DELAY, SM_SETTLE);
+      if (rst_inner || en_counter_last) chk_open <= 1'b0;
+      if (!ram_is_softmax && chk_inv_d && !cfg[WB_A_ADDR_INVALID][0] && sm_bank_written && !cfg[WB_A_ADDR_DONE][0] && !rst_inner) chk_open <= 1'b1;
+      if (sm_auto_ack) chk_open <= 1'b1;
+    end
+  end
+  // synthesis translate_on
+
 endmodule

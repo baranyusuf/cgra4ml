@@ -155,6 +155,7 @@ def export_inference(model, hw, batch_size=1):
     '''
     x_bytes_all = x_bytes = w_bytes = b_words = x_bytes_max = nhwc_words_max = o_bytes_max = o_words_max = 0
     sm_words = 0
+    assert all(bb.softmax_frac <= hw.SM_TAB_F for bb in BUNDLES if bb.softmax), f"softmax_frac must be <= {hw.SM_TAB_F} (X_BITS-1)"
     with open (f'./config_fw.h', 'w') as ch:
 
         ch.write(f"#define N_BUNDLES {len(BUNDLES)}\n")
@@ -192,8 +193,10 @@ def export_inference(model, hw, batch_size=1):
             x_bytes_b = (x_bpt_p0 + (b.r.CP-1)*x_bpt)
             nhwc_words_b = b.r.XN * b.r.XH * b.r.XW * b.r.CO
             if b.softmax:
-                sm_words = nhwc_words_b
+                sm_words = max(sm_words, nhwc_words_b)   # logit/prob RAM must hold the largest softmax bundle output
                 assert hw.X_BITS <= 8, f"PL softmax stores logits in 8 bits, X_BITS={hw.X_BITS}"
+                assert b.pool is None, "PL softmax bundle cannot have pooling"
+                assert (b.softmax_act is None) == (ib == len(BUNDLES)-1), "softmax=True (float probabilities) is for the last bundle; a softmax in an earlier bundle needs softmax=XActivation(...) to quantize its output for the next bundle"
 
             x_bytes_max = max(x_bytes_max, x_bytes_b)
             nhwc_words_max = max(nhwc_words_max, nhwc_words_b)
@@ -237,7 +240,7 @@ def export_inference(model, hw, batch_size=1):
             ch.write(f"   {{.n={b.r.XN:<3}, .l={b.r.XL:<3}, .kw={b.r.KW:<3}, .coe={y_coe:<3}, .h={b.r.XH:<3}, .w={b.r.XW:<3}, .ci={b.r.CI:<4}, .co={b.r.CO:<4}, .w_kw2={b.r.XW-b.r.KW//2:<3}, .t={b.r.IT:<3}, .p={b.r.CP:<3}, .cm={b.r.CM:<3}, .cm_p0={b.r.CM_0:<3}, .on={b.r.ON:<3}, .oh={b.r.OH:<3}, .ow={b.r.OW:<3}, .oc={b.r.OC:<4}, .ch={b.r.CYH:<3}, .ph={b.r.PYH:<3}, .cw={b.r.CYW:<3}, .pw={b.r.PYW:<3}, .pkh={b.r.PKH:<3}, .psh={b.r.PSH:<3}, .pkw={b.r.PKW:<3}, .psw={b.r.PSW:<3}, ")
             ch.write(     f".xp_words={xp_words:<6}, .b_offset={b_words:<5}, .w_bpt={w_bpt:<5}, .w_bpt_p0={w_bpt_p0:<5}, .x_bpt={x_bpt:<8}, .x_bpt_p0={x_bpt_p0:<8}, .o_words={o_words_b:<8}, .o_bytes={o_bytes_b:<8}, ")
             ch.write(     f".ib_out={ib_out:<4}, .in_buffer_idx={in_buffer_idx:<3}, .out_buffer_idx={b.out_buffer_idx:<3}, .add_out_buffer_idx={add_out_buffer_idx:<2}, .add_in_buffer_idx={add_in_buffer_idx:<2}, ")
-            ch.write(     f".is_bias={1*(b.core.b is not None):<3}, .is_flatten={1*(b.flatten is not None):<3}, .is_softmax={1*(b.softmax is not None):<3}, ")
+            ch.write(     f".is_bias={1*(b.core.b is not None):<3}, .is_flatten={1*(b.flatten is not None):<3}, .is_softmax={1*(b.softmax is not None):<3}, .sm_shift={hw.SM_TAB_F - b.softmax_frac if b.softmax else 0:<3}, .sm_out_frac={b.softmax_act.out.frac if b.softmax_act is not None else 0:<3}, ")
             ch.write(     f".x_pad={b.r.X_PAD:<3}, .b_val_shift={b.core.bias_val_shift:<3}, .b_bias_shift={b.core.bias_b_shift:<3}, .ca_nzero={ca_nzero:<3}, .ca_shift={ca_shift:<3}, .ca_pl_scale={ca_pl_scale:<3}, .aa_nzero={aa_nzero:<3}, .aa_shift={aa_shift:<3}, .aa_pl_scale={aa_pl_scale:<3}, .add_val_shift={add_val_shift:<3}, .add_a_shift={add_a_shift:<3}, .pa_nzero={pa_nzero:<3}, .pa_shift={pa_shift:<3}, .pa_pl_scale={pa_pl_scale:<3}, ")
             ch.write(     f".csh={b.r.CSH:<3}, .csh_shift={b.r.CSH_SHIFT:<3}, .psh_shift={b.r.PSH_SHIFT:<3}, .csw={b.r.CSW:<3}, .csw_shift={b.r.CSW_SHIFT:<3}, .psw_shift={b.r.PSW_SHIFT:<3}, .pool={pool_type:<10}, ")
             ch.write(     f".header={b.r.header:>23}u, ")
@@ -272,12 +275,9 @@ def export_inference(model, hw, batch_size=1):
         ch.write(f"#define WB_BIAS_BASE ({32 + hw.MAX_N_BUNDLES*32})  // word offset of bias RAM inside the writeback register space (32 regs + 32 words per bundle)\n")
         ch.write(f"#define WB_ADD_BASE  ({32 + hw.MAX_N_BUNDLES*32 + max(b_words, 1)})  // word offset of the residual-add buffer RAM (right after the bias RAM); buffer k element i is at WB_ADD_BASE + k*NHWC_WORDS + i\n")
         add_words = max(len(add_buffer_map) * nhwc_words_max, 1)
-        sm_tab_base  = 32 + hw.MAX_N_BUNDLES*32 + max(b_words, 1) + add_words      # exp table window (256 words)
-        sm_prob_base = sm_tab_base + 256                                           # probability window (SOFTMAX_WORDS words)
-        ch.write(f"#define WB_SM_TAB_BASE  ({sm_tab_base})   // word offset of the softmax exp table (256 words) inside the writeback register space\n")
-        ch.write(f"#define WB_SM_PROB_BASE ({sm_prob_base})  // word offset of the softmax probability RAM (read by the PS)\n")
+        sm_tab_base  = 32 + hw.MAX_N_BUNDLES*32 + max(b_words, 1) + add_words      # exp table window (SM_TAB_N words)
+        ch.write(f"#define WB_SM_TAB_BASE  ({sm_tab_base})   // word offset of the softmax exp table (SM_TAB_N words) inside the writeback register space\n")
         ch.write(f"#define SM_FRAC_BITS 24      // exp table and probabilities are fixed point with 24 fractional bits\n")
-        ch.write(f"#define Y_DUMP_SHIFT {24 if BUNDLES[-1].softmax else 17}  // simulation dump scale of the last bundle output\n")
         ch.write(f"#define AXI_WIDTH   {hw.AXI_WIDTH}\n")
         ch.write(f"#define CONFIG_BASEADDR 0x{hw.CONFIG_BASEADDR}\n")
         ch.write(f'#define DATA_DIR   "../{hw.DATA_DIR}"\n\n')
@@ -285,7 +285,7 @@ def export_inference(model, hw, batch_size=1):
         assert b_words <= (1 << 17)
 
         # Softmax exp table (used by the PL): tab[d] = round(exp(-d / 2^frac) * 2^24), d = max_logit - logit
-        sm_tab = softmax_exp_table(BUNDLES[-1].softmax_frac, hw.X_BITS) if BUNDLES[-1].softmax else [0]
+        sm_tab = softmax_exp_table(hw.SM_TAB_F, hw.SM_TAB_N)      # one table for every softmax bundle (each bundle shifts its index by sm_shift)
         ch.write(f"#define SM_TAB_N    {len(sm_tab)}\n")
         ch.write(f"static const uint32_t sm_tab [SM_TAB_N] = {{ {', '.join(str(int(v)) for v in sm_tab)} }};\n")
 
@@ -339,6 +339,8 @@ def export_inference(model, hw, batch_size=1):
         for ib, b in enumerate(BUNDLES):
             assert ib == b.ib
             np.savetxt(f"{hw.DATA_DIR}/{b.ib}_y_nhwc_exp.txt", b.oe_exp_nhwc.flatten(), fmt='%d')
+            if b.softmax:
+                np.savetxt(f"{hw.DATA_DIR}/{b.ib}_pre_softmax.txt", b.pre_softmax.itensor.numpy().flatten(), fmt='%d')   # logits seen by the softmax unit
             np.savetxt(f"{hw.DATA_DIR}/{b.ib}_xe.txt", np.concatenate([a.flatten() for a in b.xe]), fmt='%d')
             for ip in range(b.r.CP):
                 CM_p = b.r.CM_0 if ip==0 else b.r.CM
@@ -369,10 +371,13 @@ def export_inference(model, hw, batch_size=1):
 
 
 
-def softmax_exp_table(frac, x_bits, q=24):
-    '''exp(-d / 2^frac) * 2^q, d = 0 .. 2^x_bits-1. Same table is loaded into the PL softmax unit.'''
-    d = np.arange(2**x_bits, dtype=np.float64)
-    return np.floor(np.exp(-d / 2.0**frac) * 2.0**q + 0.5).astype(np.int64).tolist()
+def softmax_exp_table(F, N, q=24):
+    '''exp(-j / 2^F) * 2^q, j = 0 .. N-1 (F = X_BITS-1, N from hardware.softmax_tab_params). One table for all softmax bundles:
+    a bundle whose logits have f fractional bits reads tab[d << (F - f)]. Loaded into the PL softmax unit at start.'''
+    j = np.arange(N, dtype=np.float64)
+    t = np.floor(np.exp(-j / 2.0**F) * 2.0**q + 0.5).astype(np.int64)
+    assert t[-1] == 0 and (N == 1 or t[-2] > 0)
+    return t.tolist()
 
 
 def verify_inference(model, hw, SIM, SIM_PATH='', TRACE=False):
@@ -412,10 +417,10 @@ Simulation completed, but files were not generated. Either
                 y_tiled_exp = b.out.ftensor.numpy().reshape(1,b.r.XN,1,b.r.CO)
                 y_tiled_sim = np.loadtxt(f"{hw.DATA_DIR}/{b.ib}_y_tiled_sim.txt", np.float32).reshape(y_tiled_exp.shape)/2**24
                 error = np.max(np.abs(y_tiled_sim-y_tiled_exp))
-                assert np.allclose(y_tiled_sim, y_tiled_exp, atol=1e-5), f"Error={error}, \nsub:\n{y_tiled_sim-y_tiled_exp} for y_tiled_sim at {b.ib=}. \n y_tiled_sim=\n{y_tiled_sim} \n y_tiled_exp=\n{y_tiled_exp}\n \npre_softmax=\n{b.pre_softmax}"
+                assert np.allclose(y_tiled_sim, y_tiled_exp, atol=1e-5), f"Error={error}, \nsub:\n{y_tiled_sim-y_tiled_exp} for y_tiled_sim at {b.ib=}. \n y_tiled_sim=\n{y_tiled_sim} \n y_tiled_exp=\n{y_tiled_exp}\n \npre_softmax=\n{getattr(b, 'pre_softmax', None)}"
             else:
                 y_tiled_exp = b.o_int
-                y_tiled_sim = np.loadtxt(f"{hw.DATA_DIR}/{b.ib}_y_tiled_sim.txt", np.float32).reshape(y_tiled_exp.shape)/2**17
+                y_tiled_sim = np.loadtxt(f"{hw.DATA_DIR}/{b.ib}_y_tiled_sim.txt", np.float32).reshape(y_tiled_exp.shape)
                 error = np.sum(np.abs(y_tiled_sim-y_tiled_exp))
                 assert error == 0, f"Error={error}, for y_tiled_sim at {b.ib=}"
         else:

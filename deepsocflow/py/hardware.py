@@ -8,6 +8,16 @@ import deepsocflow
 import time
 
 
+def softmax_tab_params(x_bits, q=24):
+    """PL softmax exp table: tab[j] = round(exp(-j / 2^F) * 2^q), F = x_bits-1 (largest logit fraction a signed x_bits logit can have).
+    N = index of the first entry that rounds to 0 (+1); indices past it are clamped to it in hardware."""
+    F = x_bits - 1
+    j = 0
+    while int(np.floor(np.exp(-j / 2.0**F) * 2.0**q + 0.5)) > 0:
+        j += 1
+    return F, j + 1
+
+
 class Hardware:
     """
     Class to store static (pre-synthesis) parameters of the accelerator and export them to SystemVerilog and TCL scripts.
@@ -65,6 +75,7 @@ class Hardware:
         self.ROWS, self.COLS = processing_elements
         self.FREQ   = frequency_mhz
         self.X_BITS = bits_input
+        self.SM_TAB_F, self.SM_TAB_N = softmax_tab_params(bits_input)   # softmax exp table resolution / size
         self.K_BITS = bits_weights
         self.Y_BITS = bits_sum
         self.B_BITS = bits_bias
@@ -198,6 +209,7 @@ class Hardware:
 `define BIAS_WORDS          {self.RAM_BIAS_DEPTH     :<10}
 `define ADD_WORDS           {self.RAM_ADD_DEPTH      :<10} 
 `define SOFTMAX_WORDS       {self.RAM_SOFTMAX_DEPTH  :<10}
+`define SOFTMAX_TAB_N       {self.SM_TAB_N:<10}  // exp table entries
 ''')
 
         with open('config_reg.def', 'w') as f:
@@ -223,7 +235,6 @@ WB_A_BUNDLE_STATUS   ,
 WB_A_PIXEL_PACK      ,
 WB_A_OUT_FLAGS       ,
 WB_A_PIXEL_PACK2     ,
-WB_A_SM_STATUS       ,
 ''')
 
         with open('config_hw.tcl', 'w') as f:
