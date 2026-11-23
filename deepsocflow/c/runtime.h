@@ -51,7 +51,6 @@ typedef struct {
   
   // These are written often, keep them on OCM
   Y_TYPE ocm            [2][PE_COLS*PE_ROWS];
-  int32_t nhwc           [NHWC_WORDS  ];
   int8_t  out_buffers    [N_OUT_BUF   ][O_BYTES_MAX ];
   
 #ifdef XDEBUG
@@ -165,12 +164,13 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
     wb_bundles[ib][17]= bundles[ib].cw;
     wb_bundles[ib][18] = PE_ROWS / bundles[ib].csh;
     wb_bundles[ib][19] = PE_ROWS % bundles[ib].csh;
-    wb_bundles[ib][20] = bundles[ib].is_bias;  // PL adds bias
-    wb_bundles[ib][21] = bundles[ib].b_val_shift;
-    wb_bundles[ib][22] = bundles[ib].b_bias_shift;
-    wb_bundles[ib][23] = bundles[ib].ca_nzero;      // PL does core activation (quant_lrelu)
-    wb_bundles[ib][24] = bundles[ib].ca_shift;
-    wb_bundles[ib][25] = bundles[ib].ca_pl_scale;
+    // Pooling parameters go to the unused upper bits of words 20..25 (layout: see the comment above ram_pool_mode in writeback.sv); the low byte keeps the old field
+    wb_bundles[ib][20] = (bundles[ib].is_bias & 0xFF) | ((bundles[ib].pool & 0x3) << 8);  // PL adds bias | pool mode
+    wb_bundles[ib][21] = (bundles[ib].b_val_shift & 0xFF) | ((bundles[ib].pkh & 0xFF) << 8) | ((bundles[ib].pkw & 0xFF) << 16) | (((uint32_t)bundles[ib].psh_shift & 0xFF) << 24);
+    wb_bundles[ib][22] = (bundles[ib].b_bias_shift & 0xFF) | ((bundles[ib].psh & 0xFF) << 8) | ((bundles[ib].psw & 0xFF) << 16) | (((uint32_t)bundles[ib].psw_shift & 0xFF) << 24);
+    wb_bundles[ib][23] = (bundles[ib].ca_nzero != 0) | ((bundles[ib].pa_nzero != 0) << 8);      // PL does core activation (quant_lrelu) | pool activation nzero
+    wb_bundles[ib][24] = (bundles[ib].ca_shift & 0xFF) | ((bundles[ib].pa_shift & 0xFF) << 8) | ((bundles[ib].ph & 0x3FF) << 16);
+    wb_bundles[ib][25] = (bundles[ib].ca_pl_scale & 0xFF) | ((bundles[ib].pa_pl_scale & 0xFF) << 8) | ((bundles[ib].pw & 0x3FF) << 16);
     wb_bundles[ib][26] = -(1 << (X_BITS - bundles[ib].ca_pl_scale - 1));  // clip min
     wb_bundles[ib][27] = (1 << (X_BITS - 1)) - 1;                         // clip max
     wb_bundles[ib][28] = bundles[ib].add_in_buffer_idx == -1 ? -1 : bundles[ib].add_in_buffer_idx * NHWC_WORDS;  // PL residual add: buffer base (-1 = none)
@@ -335,10 +335,6 @@ extern EXT_C void run(Memory_st *restrict mp) {
   static i32 ib=0;
   static i8 *restrict p_out_buffer = 0;
 
-  i32   iy_nhwc;
-  idiv_t div_ixh, div_ixw;
-  i32   ph_end, ph_beg_const, ixh_beg, xh_sweep;
-  i32   pw_end, pw_beg_const, ixw_beg, xw_sweep;
   i32   bundle_counter;
   i32   bundle_limit;
 
@@ -397,79 +393,17 @@ PROCESS_AND_STORE_DONE:
       i_yn    =  pk         & 0x1F;       
       i_yh    = (pk >> 5)   & 0x3FF;    
 
-      iy_nhwc = fb_read_reg32(p_writeback + WB_A_IY_NHWC_CONV);
-
       pk2 = fb_read_reg32(p_writeback + WB_A_PIXEL_PACK2);
       i_yw = pk2 & 0x3FF;       
       i_yc = (pk2 >> 10) & 0x3FFFFF;
 
       fb_write_reg32(p_writeback + WB_A_ADDR_EN_COUNTER, 1);
-  
-     
 
-      // ------ MAX/AVG POOL ---
-
-      if (pb->pool == POOL_NONE) {
-        tile_write(out_val, p_out_buffer, ib, pb, mp, i_yn, i_yh, i_yw, i_yc, yn, yh, yw, yc);
-        goto PROCESS_AND_STORE_DONE;
-      }
-
-      mp->nhwc[iy_nhwc] = out_val;
-
-      div_ixh = idiv(i_yh+pb->psh_shift-pb->pkh+1, pb->psh);
-      div_ixw = idiv(i_yw+pb->psw_shift-pb->pkw+1, pb->psw);
-      ixh_beg = div_ixh.quot; // ix(hw) that corresponds to the pooling window
-      ixw_beg = div_ixw.quot;
-
-      if (ixh_beg < 0 || ixw_beg < 0) // skip when target ix(h,w) < 0
-        goto PROCESS_AND_STORE_DONE;
-
-      // Pool Striding
-      if (div_ixh.rem != 0) {                       // invalid ixh
-        if (i_yh==yh-1) ixh_beg += 1;                  //but last yh. start sweeping
-        else            goto PROCESS_AND_STORE_DONE;   // not last yh. skip
-      }
-
-      if (div_ixw.rem != 0) {
-        if (i_yw==yw-1) ixw_beg += 1;
-        else            goto PROCESS_AND_STORE_DONE;
-      }
-
-      ph_end       = i_yh; // iy(h,w) is the bottom-right of pooling window -> All values in pooling window have been computed
-      pw_end       = i_yw;
-      ph_beg_const = max(pb->psh*ixh_beg-pb->psh_shift, 0)-1; // p(h,w)_beg is the index of top left corner of pooling window. If negative, set to zero
-      pw_beg_const = max(pb->psw*ixw_beg-pb->psw_shift, 0)-1;
-
-      xh_sweep = i_yh == yh-1 ? pb->ph : ixh_beg+1; // ix(hw) is sweeped from ix(hw)_beg to x(h,w)_sweep. Normally sweep is 1.
-      xw_sweep = i_yw == yw-1 ? pb->pw : ixw_beg+1; // But when iy(h,w) is at its edges, need to compute remaining ix(hw) pixels by sweeping
-      
-
-      // Sweep the pooling window
-      for (i32 ixh = ixh_beg, ph_beg = ph_beg_const;  ixh < xh_sweep;  ixh++, ph_beg += pb->psh) {
-        for (i32 ixw = ixw_beg, pw_beg = pw_beg_const;  ixw < xw_sweep;  ixw++, pw_beg += pb->psw) {
-
-          // Traverse each pool window & perform pooling
-          i32 result = pb->pool == POOL_MAX ? INT_MIN : 0;
-          for (i32 ipyh = ph_end; ipyh > ph_beg; ipyh--){
-            for (i32 ipyw = pw_end; ipyw > pw_beg; ipyw--){
-
-            i32 read_idx = flatten_nhwc(i_yn, ipyh, ipyw, i_yc,    yn, yh, yw, yc, "Inside pool window", DEBUG_INFO);
-            i32 read_val = mp->nhwc[read_idx];
-            result = pb->pool==POOL_MAX ? max(result, read_val) : (result + read_val);
-            }
-         }
-
-        // ------ AVG POOL: Divide & Activation ------
-        if (pb->pool == POOL_AVG) {
-          i32 count  = (ph_end-ph_beg)*(pw_end-pw_beg);
-          result = div_round(result, count);
-          out_val = quant_lrelu(out_val, pb->pa_nzero, pb->pa_shift, pb->pa_pl_scale);
-          }
-
-        tile_write(result, p_out_buffer, ib, pb, mp,   i_yn, ixh, ixw, i_yc,  yn, pb->ph, pb->pw, yc); // Write
-        }
-
-      }
+      // The PL does MAX/AVG pooling and its activation: for a pooled bundle (i_yh, i_yw) is already the pooled pixel (ixh, ixw)
+      if (pb->pool == POOL_NONE)
+        tile_write(out_val, p_out_buffer, ib, pb, mp, i_yn, i_yh, i_yw, i_yc, yn, yh,     yw,     yc);
+      else
+        tile_write(out_val, p_out_buffer, ib, pb, mp, i_yn, i_yh, i_yw, i_yc, yn, pb->ph, pb->pw, yc);
   }
   BUNDLE_DONE:
   fb_write_reg32(p_writeback + WB_A_ADDR_DONE, 0);

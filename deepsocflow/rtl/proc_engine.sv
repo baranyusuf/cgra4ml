@@ -189,27 +189,21 @@ endgenerate
 
         n_delay #(.N(DELAY_MUL-1), .W(M_BITS)) MUL_PIPE (.c(clk), .rng(resetn), .rnl(1'b1), .e(clken_mul[c]), .i(mul_comb), .o (mul_m_data[c][r]));
         
-        // changed shift_data to FF instead of wire, so that it has previous cycle data. 
-        // shift_data[i] is loaded with acc_m_data[i-1] when acc_m_valid[i-1] is high. 
-        // This is because the column i will get sel_shift one cycle after column i-1.
+        // shift_data[c] is the partial sum that column c-1 hands to column c in column c's shift cycle.
+        // shift_data_q holds the value of acc_m_data[c-1] captured while acc_m_valid[c-1] was high (column c's shift cycle is normally >= 1 cycle after that).
+        // When the freeze/release logic leaves columns c-1 and c in the same phase, column c's shift cycle coincides with the
+        // cycle in which acc_m_valid[c-1] is high and shift_data_q is not updated yet, so the accumulator output is forwarded directly.
+        logic signed [Y_BITS-1:0] shift_data_q;
         if(c == 0) begin
-          always_ff @ (posedge clk `OR_NEGEDGE(resetn)) begin
-            if(!resetn) shift_data [c][r] <= '0;
-            else begin
-              shift_data [c][r] <= '0;
-            end
-          end
+          assign shift_data [c][r] = '0;
         end
         else begin // c > 0
           always_ff @ (posedge clk `OR_NEGEDGE(resetn)) begin
-            if(!resetn) shift_data [c][r] <= '0;
-            else begin
-              if (acc_m_valid[c-1]) shift_data [c][r] <= acc_m_data [c-1][r];
-            end
+            if(!resetn) shift_data_q <= '0;
+            else if (acc_m_valid[c-1]) shift_data_q <= acc_m_data [c-1][r];
           end
+          assign shift_data [c][r] = acc_m_valid[c-1] ? acc_m_data [c-1][r] : shift_data_q;
         end
-        //if (c == 0) assign shift_data [c][r] = '0;
-        //else        assign shift_data [c][r] = acc_m_data [c-1][r];
 
         // Two muxes
         wire signed [Y_BITS -1:0] add_in_1 = sel_shift[c] ? shift_data [c][r]: Y_BITS'($signed(mul_m_data[c][r]));

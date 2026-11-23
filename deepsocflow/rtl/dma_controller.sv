@@ -141,6 +141,7 @@ module dma_controller #(
     .BIAS_WORDS     (`BIAS_WORDS    ),
     .ADD_WORDS      (`ADD_WORDS     ),
     .SM_WORDS       (`SOFTMAX_WORDS ),
+    .POOL_WORDS     (`POOL_WORDS    ),
     .SM_TAB_N       (`SOFTMAX_TAB_N )
   ) WB (
     .clk        (clk                     ),

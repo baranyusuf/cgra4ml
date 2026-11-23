@@ -15,6 +15,7 @@ module writeback #(
     ADD_WORDS       = 1    ,  // size of local residual-add RAM (bytes)
     SM_WORDS        = 1    ,  // output words of the softmax bundle (logit / probability RAM)
     SM_TAB_N        = 2220 ,  // entries of the softmax exp table
+    POOL_WORDS      = 1    ,  // conv-output words of the largest pooled bundle (pool RAM, bytes)
 
   localparam  
     WIDTH              = 32  ,
@@ -28,7 +29,8 @@ module writeback #(
     RAW_BUF_ADDR_WIDTH = $clog2(RAW_BUF_DEPTH),
     NHWC_ADDR_W = $clog2(NHWC_WORDS),
     BIAS_ADDR_W = (BIAS_WORDS > 1) ? $clog2(BIAS_WORDS) : 1,
-    SM_ADDR_W   = (SM_WORDS > 1) ? $clog2(SM_WORDS) : 1
+    SM_ADDR_W   = (SM_WORDS > 1) ? $clog2(SM_WORDS) : 1,
+    POOL_ADDR_W = (POOL_WORDS > 1) ? $clog2(POOL_WORDS) : 1
 )(
   input  logic clk,
   input  logic rstn,
@@ -372,6 +374,22 @@ module writeback #(
   logic [WIDTH-1:0] ram_ca_nzero, ram_ca_shift, ram_ca_pl_scale, ram_clip_min, ram_clip_max;
   logic [WIDTH-1:0] ram_add_base, ram_aa_pack, ram_aa_clip_min, ram_add_shifts;
   wire              ram_is_softmax = ram_add_shifts[16]; // bundle word 31 bit 16: this bundle's outputs go through the PL softmax
+  // Pooling parameters sit in the unused upper bits of the header words 20..25 (the low byte of each word keeps its old field):
+  //   word 20 [9:8] pool mode (0 none, 1 max, 2 avg)
+  //   word 21 [15:8] pkh   [23:16] pkw   [31:24] psh_shift       (low bits: b_val_shift)
+  //   word 22 [15:8] psh   [23:16] psw   [31:24] psw_shift       (low bits: b_bias_shift)
+  //   word 23 [8] pa_nzero                                       (bit 0: ca_nzero)
+  //   word 24 [12:8] pa_shift   [25:16] ph (pooled height)       (low bits: ca_shift)
+  //   word 25 [12:8] pa_pl_scale [25:16] pw (pooled width)       (low bits: ca_pl_scale)
+  wire [1:0]        ram_pool_mode   = ram_is_bias[9:8];
+  wire              ram_is_pool     = (ram_pool_mode != 2'd0);
+  wire [7:0]        ram_pkh = ram_b_val_shift [15:8], ram_pkw = ram_b_val_shift [23:16], ram_psh_shift = ram_b_val_shift [31:24];
+  wire [7:0]        ram_psh = ram_b_bias_shift[15:8], ram_psw = ram_b_bias_shift[23:16], ram_psw_shift = ram_b_bias_shift[31:24];
+  wire              ram_pa_nzero    = ram_ca_nzero[8];
+  wire [4:0]        ram_pa_shift    = ram_ca_shift[12:8];
+  wire [9:0]        ram_ph          = ram_ca_shift[25:16];
+  wire [4:0]        ram_pa_pl_scale = ram_ca_pl_scale[12:8];
+  wire [9:0]        ram_pw          = ram_ca_pl_scale[25:16];
 
   localparam ACTUAL_READ_WIDTH = 32 * WIDTH;
   assign ram_rd_addr = SRAM_RD_ADDR_WIDTH'(i_b);
@@ -523,7 +541,7 @@ module writeback #(
   wb_quant_lrelu #(.WIDTH(WIDTH)) CORE_ACT (
     .clk(clk), .rstn(rstn),
     .x        ($signed(WIDTH'(sum_biased))),
-    .nzero    (ram_ca_nzero != 0),
+    .nzero    (ram_ca_nzero[0]),
     .shift    (ram_ca_shift   [4:0]),
     .pl_scale (ram_ca_pl_scale[4:0]),
     .clip_min ($signed(ram_clip_min)),
@@ -617,17 +635,25 @@ module writeback #(
   //  same: a pixel is accepted only when the raw bank that is being read has been written completely (DONE_WRITE_x).
   //  The value is then ready LAT_RAM_WR_RD (RAM write -> read data) + LAT_PIPE clocks after the later of: flag low, bank written.
   localparam             LAT_RAM_WR_RD = 1;
-  localparam             SM_SETTLE     = LAT_RAM_WR_RD + LAT_PIPE;                       // = 12
-  localparam             SM_VCNT_W     = $clog2(SM_SETTLE + 1) + 1;
-  wire                   sm_bank_written = raw_ocm_bank_rd ? cfg[WB_A_DONE_WRITE_1][0] : cfg[WB_A_DONE_WRITE_0][0];
-  wire                   sm_not_ready  = cfg[WB_A_ADDR_INVALID][0] || !sm_bank_written;
-  logic [SM_VCNT_W-1:0]  sm_vcnt;
-  logic                  sm_arm;
+  localparam             PX_SETTLE     = LAT_RAM_WR_RD + LAT_PIPE;                       // = 12
+  localparam             PX_VCNT_W     = $clog2(PX_SETTLE + 1) + 1;
+  wire                   px_bank_written = raw_ocm_bank_rd ? cfg[WB_A_DONE_WRITE_1][0] : cfg[WB_A_DONE_WRITE_0][0];
+  wire                   px_not_ready  = cfg[WB_A_ADDR_INVALID][0] || !px_bank_written;
+  logic [PX_VCNT_W-1:0]  px_vcnt;
+  logic                  px_arm;
   logic                  sm_idle, sm_em_valid;
+  logic                  pool_idle, pool_em_valid, pool_done;
   logic [WIDTH-1:0]      sm_em_data, sm_em_k;
-  wire                   sm_pix_valid = !sm_not_ready && (sm_vcnt == SM_VCNT_W'(SM_SETTLE)) && !cfg[WB_A_ADDR_DONE][0];   // outval_p has left the pipeline
-  wire                   sm_auto_ack  = ram_is_softmax && sm_arm && sm_pix_valid && sm_idle && !sm_em_valid;
-  wire                   sm_em_ack    = reg_wr_en && (reg_wr_addr == WB_A_ADDR_EN_COUNTER) && reg_wr_data[0] && sm_em_valid;
+  wire                   px_valid = !px_not_ready && (px_vcnt == PX_VCNT_W'(PX_SETTLE)) && !cfg[WB_A_ADDR_DONE][0];   // outval_p has left the pipeline
+  wire                   sm_auto_ack  = ram_is_softmax && px_arm && px_valid && sm_idle && !sm_em_valid;
+  // The PS acknowledges every emitted result (softmax class / pooled pixel) with a write to ADDR_EN_COUNTER, which must not move the counters.
+  wire                   em_any_valid = sm_em_valid || pool_em_valid;
+  wire                   em_ack_any   = reg_wr_en && (reg_wr_addr == WB_A_ADDR_EN_COUNTER) && reg_wr_data[0] && em_any_valid;
+  wire                   sm_em_ack    = em_ack_any && sm_em_valid;
+  wire                   pool_em_ack  = em_ack_any && pool_em_valid;
+  // Pooling: the pixel is accepted like a softmax logit, but the counters are held (no ack) until the pool unit has swept all
+  // windows of the pixel and the PS has taken every pooled pixel it emitted (pool_done), so the pixel's values stay stable meanwhile.
+  wire                   pool_start   = ram_is_pool && px_arm && px_valid && pool_idle && !pool_em_valid;
   wire [21:0]            sm_cls       = pack2_p[31:10];                     // class index (iyc) of the pixel being accepted
   // The classes of a pixel arrive in ascending order (iyc = coe_t_q + i_icoe, both counters only count up, tiles t ascend),
   // so the logit of class co-1 is always the last one of its pixel and the pixel's logits end at its NHWC address.
@@ -636,12 +662,12 @@ module writeback #(
   logic [9:0]            sm_em_w;
   always_ff @(posedge clk)
     if (!rstn) begin
-      sm_vcnt <= '0; sm_arm <= 1'b0; sm_em_pack <= '0; sm_em_w <= '0;
+      px_vcnt <= '0; px_arm <= 1'b0; sm_em_pack <= '0; sm_em_w <= '0;
     end else begin
-      if (sm_not_ready)                        sm_vcnt <= '0;
-      else if (sm_vcnt != SM_VCNT_W'(SM_SETTLE)) sm_vcnt <= sm_vcnt + SM_VCNT_W'(1);
-      if (cfg[WB_A_ADDR_INVALID][0]) sm_arm <= 1'b1;   // armed again once the counters have moved on
-      else if (sm_auto_ack)          sm_arm <= 1'b0;   // one ack per pixel
+      if (px_not_ready)                        px_vcnt <= '0;
+      else if (px_vcnt != PX_VCNT_W'(PX_SETTLE)) px_vcnt <= px_vcnt + PX_VCNT_W'(1);
+      if (cfg[WB_A_ADDR_INVALID][0]) px_arm <= 1'b1;   // armed again once the counters have moved on
+      else if (sm_auto_ack || pool_start) px_arm <= 1'b0;   // one pixel is accepted once
       if (sm_auto_ack && sm_last) begin                // coordinates of the pixel whose results will be emitted
         sm_em_pack <= pack_p;
         sm_em_w    <= pack2_p[9:0];
@@ -658,6 +684,25 @@ module writeback #(
     .tab_addr(SM_TAB_AW'(reg_wr_addr - SM_TAB_BASE)), .tab_data(WIDTH'(reg_wr_data)),
     .em_valid(sm_em_valid), .em_data(sm_em_data), .em_k(sm_em_k), .em_ack(sm_em_ack),
     .idle(sm_idle)
+  );
+
+  // ---- POOLING (PL): see wb_pool.sv ----
+  logic [WIDTH-1:0] pool_em_data;
+  logic [9:0]       pool_em_h, pool_em_w;
+  logic [21:0]      pool_em_c;
+  logic [4:0]       pool_em_n;
+  wb_pool #(.WIDTH(WIDTH), .WORDS(POOL_WORDS)) POOL (
+    .clk(clk), .rstn(rstn),
+    .start(pool_start), .pix_addr(POOL_ADDR_W'(iy_nhwc_conv)), .pix_val(outval_p[7:0]),
+    .pix_h(pack_p[14:5]), .pix_w(pack2_p[9:0]), .pix_c(pack2_p[31:10]), .pix_n(pack_p[4:0]),
+    .mode_avg(ram_pool_mode == 2'd2), .yh(ram_ch), .yw(ram_cw), .step_c(ram_co), .step_h(cw_co_q),
+    .pkh(ram_pkh), .pkw(ram_pkw), .psh(ram_psh), .psw(ram_psw), .psh_shift(ram_psh_shift), .psw_shift(ram_psw_shift),
+    .ph(ram_ph), .pw(ram_pw),
+    .pa_nzero(ram_pa_nzero), .pa_shift(ram_pa_shift), .pa_pl_scale(ram_pa_pl_scale),
+    .pa_clip_min(-$signed((ram_clip_max + WIDTH'(1)) >> ram_pa_pl_scale)), .pa_clip_max($signed(ram_clip_max)),
+    .em_valid(pool_em_valid), .em_data(pool_em_data), .em_h(pool_em_h), .em_w(pool_em_w), .em_c(pool_em_c), .em_n(pool_em_n),
+    .em_ack(pool_em_ack),
+    .idle(pool_idle), .done(pool_done)
   );
 
   always_ff @(posedge clk)
@@ -791,7 +836,7 @@ module writeback #(
       if (addr_enable_counter) 
         cfg[WB_A_ADDR_EN_COUNTER] <= WIDTH'(0);
 
-      if (sm_auto_ack)                                   // PL accepts the logit pixel itself
+      if (sm_auto_ack || pool_done)                      // PL accepts the logit pixel itself / has finished the pooling of the pixel
         cfg[WB_A_ADDR_EN_COUNTER] <= WIDTH'(1);
       
 
@@ -834,14 +879,20 @@ module writeback #(
       cfg[WB_A_IY_NHWC_CONV] <= iy_nhwc_conv;
       if (sm_em_valid)                                   // softmax result of one class: valid pixel for the PS
         cfg[WB_A_OUT_FLAGS] <= WIDTH'(sm_em_data & 32'h3FFF_FFFF);
+      else if (pool_em_valid)                            // pooled pixel: valid pixel for the PS
+        cfg[WB_A_OUT_FLAGS] <= WIDTH'(pool_em_data & 32'h3FFF_FFFF);
       else if (ram_is_softmax)                           // logits are hidden; done only once the softmax unit is idle
         cfg[WB_A_OUT_FLAGS] <= WIDTH'((WIDTH'(cfg[WB_A_ADDR_DONE][0] && sm_idle) << 30) | (WIDTH'(1) << 31));
+      else if (ram_is_pool)                              // conv pixels are hidden; the PS only sees pooled pixels
+        cfg[WB_A_OUT_FLAGS] <= WIDTH'((WIDTH'(cfg[WB_A_ADDR_DONE][0] && pool_idle) << 30) | (WIDTH'(1) << 31));
       else
         cfg[WB_A_OUT_FLAGS] <= WIDTH'((outval_p & 32'h3FFF_FFFF) 
                      | (WIDTH'(cfg[WB_A_ADDR_DONE][0])    << 30) 
                      | (WIDTH'(cfg[WB_A_ADDR_INVALID][0]) << 31));
-      cfg[WB_A_PIXEL_PACK  ] <= sm_em_valid ? sm_em_pack : pack_p;
-      cfg[WB_A_PIXEL_PACK2 ] <= sm_em_valid ? (WIDTH'(sm_em_w) | (WIDTH'(sm_em_k[21:0]) << 10)) : pack2_p;
+      cfg[WB_A_PIXEL_PACK  ] <= sm_em_valid   ? sm_em_pack :
+                                pool_em_valid ? (WIDTH'(pool_em_n) | (WIDTH'(pool_em_h) << 5)) : pack_p;
+      cfg[WB_A_PIXEL_PACK2 ] <= sm_em_valid   ? (WIDTH'(sm_em_w) | (WIDTH'(sm_em_k[21:0]) << 10)) :
+                                pool_em_valid ? (WIDTH'(pool_em_w) | (WIDTH'(pool_em_c) << 10)) : pack2_p;
 
       
 
@@ -852,7 +903,7 @@ module writeback #(
  
 
     
-      if (reg_wr_en && reg_wr_addr < N_REG && !(sm_em_valid && reg_wr_addr == WB_A_ADDR_EN_COUNTER)) // PS has priority in writing to registers (its ack of a softmax result must not move the counters)
+      if (reg_wr_en && reg_wr_addr < N_REG && !(em_any_valid && reg_wr_addr == WB_A_ADDR_EN_COUNTER)) // PS has priority in writing to registers (its ack of a softmax result must not move the counters)
         cfg[reg_wr_addr] <= WIDTH'(reg_wr_data);
 
     end
@@ -876,13 +927,13 @@ module writeback #(
     if (!rstn) chk_open <= 1'b0;
     else begin
       if (chk_open && (chk_val != chk_val_d))
-        $fatal(1, "[TIMING] value changed after the pixel was taken: changed fields (outval_p,pack,pack2,iy_nhwc_conv) = %b%b%b%b  out %0d->%0d  (EN_CNT_DELAY=%0d, SM_SETTLE=%0d)",
+        $fatal(1, "[TIMING] value changed after the pixel was taken: changed fields (outval_p,pack,pack2,iy_nhwc_conv) = %b%b%b%b  out %0d->%0d  (EN_CNT_DELAY=%0d, PX_SETTLE=%0d)",
                chk_val[3*WIDTH +: WIDTH] != chk_val_d[3*WIDTH +: WIDTH], chk_val[2*WIDTH +: WIDTH] != chk_val_d[2*WIDTH +: WIDTH],
                chk_val[WIDTH +: WIDTH] != chk_val_d[WIDTH +: WIDTH], chk_val[0 +: WIDTH] != chk_val_d[0 +: WIDTH],
-               $signed(chk_val_d[3*WIDTH +: WIDTH]), $signed(chk_val[3*WIDTH +: WIDTH]), EN_CNT_DELAY, SM_SETTLE);
+               $signed(chk_val_d[3*WIDTH +: WIDTH]), $signed(chk_val[3*WIDTH +: WIDTH]), EN_CNT_DELAY, PX_SETTLE);
       if (rst_inner || en_counter_last) chk_open <= 1'b0;
-      if (!ram_is_softmax && chk_inv_d && !cfg[WB_A_ADDR_INVALID][0] && sm_bank_written && !cfg[WB_A_ADDR_DONE][0] && !rst_inner) chk_open <= 1'b1;
-      if (sm_auto_ack) chk_open <= 1'b1;
+      if (!ram_is_softmax && !ram_is_pool && chk_inv_d && !cfg[WB_A_ADDR_INVALID][0] && px_bank_written && !cfg[WB_A_ADDR_DONE][0] && !rst_inner) chk_open <= 1'b1;
+      if (sm_auto_ack || pool_start) chk_open <= 1'b1;
     end
   end
   // synthesis translate_on

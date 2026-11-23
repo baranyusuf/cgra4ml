@@ -155,6 +155,7 @@ def export_inference(model, hw, batch_size=1):
     '''
     x_bytes_all = x_bytes = w_bytes = b_words = x_bytes_max = nhwc_words_max = o_bytes_max = o_words_max = 0
     sm_words = 0
+    pool_words = 0
     assert all(bb.softmax_frac <= hw.SM_TAB_F for bb in BUNDLES if bb.softmax), f"softmax_frac must be <= {hw.SM_TAB_F} (X_BITS-1)"
     with open (f'./config_fw.h', 'w') as ch:
 
@@ -192,6 +193,11 @@ def export_inference(model, hw, batch_size=1):
             w_bytes_b = (w_bpt_p0 + (b.r.CP-1)*w_bpt)*b.r.IT
             x_bytes_b = (x_bpt_p0 + (b.r.CP-1)*x_bpt)
             nhwc_words_b = b.r.XN * b.r.XH * b.r.XW * b.r.CO
+            if b.pool is not None:
+                pool_words = max(pool_words, b.r.XN * b.r.CYH * b.r.CYW * b.r.CO)   # pool RAM holds the conv output of the bundle
+                assert hw.X_BITS <= 8, f"PL pooling stores pixels in 8 bits, X_BITS={hw.X_BITS}"
+                assert b.r.PKH < 256 and b.r.PKW < 256 and b.r.PSH < 256 and b.r.PSW < 256 and b.r.PSH_SHIFT < 256 and b.r.PSW_SHIFT < 256, f"pool size / stride / shift are 8-bit in the PL @ bundle {ib}"
+                assert b.r.PYH < 1024 and b.r.PYW < 1024, f"pooled size is 10-bit in the PL @ bundle {ib}"
             if b.softmax:
                 sm_words = max(sm_words, nhwc_words_b)   # logit/prob RAM must hold the largest softmax bundle output
                 assert hw.X_BITS <= 8, f"PL softmax stores logits in 8 bits, X_BITS={hw.X_BITS}"
@@ -365,6 +371,7 @@ def export_inference(model, hw, batch_size=1):
     hw.RAM_BIAS_DEPTH = max(b_words, 1)
     hw.RAM_ADD_DEPTH  = max(len(add_buffer_map) * nhwc_words_max, 1)
     hw.RAM_SOFTMAX_DEPTH = max(sm_words, 1)
+    hw.RAM_POOL_DEPTH = max(pool_words, 1)
     hw.export()  # config_hw.svh'yi gerçek NHWC_WORDS ile tazele
 
 
