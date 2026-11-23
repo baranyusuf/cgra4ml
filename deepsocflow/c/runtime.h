@@ -2,31 +2,18 @@
   #include <assert.h>
   #include <stdlib.h>
   #include <stdio.h>
-  #include <math.h>
-#endif
+  #endif
 #include <limits.h>
 #include <stdint.h>
-
-#define DEBUG_INFO "--- ib:%d \n",ib
-
-
-typedef struct { int quot; int rem; } idiv_t;
-static inline idiv_t idiv(int numer, int denom) {
-  idiv_t r; 
-  r.quot = numer / denom; 
-  r.rem = numer % denom; 
-  return r;
-}
 
 typedef const struct {
   const uint16_t  n, l, kw, coe, h, w, ci, co, w_kw2, t, p, cm, cm_p0, on, oh, ow, oc, ch, ph, cw, pw, pkh, psh, pkw, psw;
   const int32_t   xp_words, b_offset, w_bpt, w_bpt_p0, x_bpt, x_bpt_p0, o_words, o_bytes;
   const int8_t    ib_out, in_buffer_idx, out_buffer_idx, add_out_buffer_idx, add_in_buffer_idx;
-  const int8_t    is_bias, is_pool, is_flatten, is_softmax, sm_shift, sm_out_frac;
+  const int8_t    is_bias, is_flatten, is_softmax, sm_shift, sm_out_frac;
   const int8_t    x_pad, b_val_shift, b_bias_shift, ca_nzero, ca_shift, ca_pl_scale, aa_nzero, aa_shift, aa_pl_scale, add_val_shift, add_a_shift, pa_nzero, pa_shift, pa_pl_scale;
   const int8_t    csh, csh_shift, psh_shift, csw, csw_shift, psw_shift, pool;
   const uint64_t  header;
-  const int32_t   debug_nhwc_words;
 } Bundle_t;
 
 typedef enum {POOL_NONE, POOL_MAX, POOL_AVG} Pool_t;
@@ -35,28 +22,18 @@ typedef enum {POOL_NONE, POOL_MAX, POOL_AVG} Pool_t;
 
 #define f32__ O_TYPE
 #define X_BITS            (1 << X_BITS_L2)
-#define X_WORDS_PER_BYTE  (8 / X_BITS)
-#define X_BITS_MASK       ((1 << X_BITS) -1)
 #ifdef SIM
   #define XDEBUG
   void usleep(int x) {}
 #endif
 
+// Everything here is in DDR. The PL reads w, b, x and the out buffers, and writes the out buffers and y (the firmware never touches the outputs).
 typedef struct {
-  // These can be kept in DDR
   int8_t  w              [W_BYTES     ];
   B_TYPE  b              [B_WORDS     ]; // keep next to w. weights are loaded to w_ptr
   int8_t  x              [X_BYTES     ]; // keep next to wb. wbx is loaded to w_ptr
-  O_TYPE  y              [O_WORDS     ];
-  
-  // These are written often, keep them on OCM
-  Y_TYPE ocm            [2][PE_COLS*PE_ROWS];
-  int8_t  out_buffers    [N_OUT_BUF   ][O_BYTES_MAX ];
-  
-#ifdef XDEBUG
-  int8_t  debug_tiled    [O_WORDS_MAX ];
-  int32_t debug_nhwc     [NHWC_WORDS  ];
-#endif
+  O_TYPE  y              [O_WORDS     ]; // written by the PL (final output)
+  int8_t  out_buffers    [N_OUT_BUF   ][O_BYTES_MAX ] __attribute__((aligned(64))); // written (whole AXI beats) by the PL, read by the PL pixel DMA
 } Memory_st;
 
 #define MEM_BASEADDR 0x20000000
@@ -64,16 +41,13 @@ typedef struct {
 
 #define WORDS_IN_CFG  1024/4
 
+#define WB_BUNDLE_WORDS 64  // words reserved per bundle in the writeback header SRAM
+
 #define A_START        0x0
-#define A_DONE_READ    0x1 // 2
-#define A_DONE_WRITE   0x3 // 2
-#define A_OCM_BASE     0x5 // 2
-#define A_WEIGHTS_BASE 0x7
-#define A_BUNDLE_DONE  0x8
-#define A_N_BUNDLES_1  0x9
-#define A_W_DONE       0xA // W,X,O done are written by PL, read by PS to debug which one hangs
-#define A_X_DONE       0xB 
-#define A_O_DONE       0xC
+#define A_WEIGHTS_BASE 0x1
+#define A_N_BUNDLES_1  0x2
+#define A_W_DONE       0x3 // W,X done are written by PL, read by PS to debug which one hangs
+#define A_X_DONE       0x4
 
 enum wb_reg {
 #include "config_reg.def"
@@ -104,19 +78,8 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
   flush_cache(mp->w, WB_BYTES+X_BYTES);  // force transfer to DDR, starting addr & length
 
   // Write registers in controller
-  fb_write_reg32(p_config + A_START       , 0);  // Start
-  fb_write_reg32(p_config + A_DONE_READ +0, 1);  // Done read mp->ocm bank 0
-  fb_write_reg32(p_config + A_DONE_READ +1, 1);  // Done read mp->ocm bank 1
-  fb_write_reg32(p_config + A_DONE_WRITE+0, 0);  // Done write mp->ocm bank 0
-  fb_write_reg32(p_config + A_DONE_WRITE+1, 0);  // Done write mp->ocm bank 1
-  fb_write_reg32(p_config + A_OCM_BASE  +0, fb_addr_64to32(mem_phy.ocm[0]));  // Base addr mp->ocm bank 0
-  fb_write_reg32(p_config + A_OCM_BASE  +1, fb_addr_64to32(mem_phy.ocm[1]));  // Base addr mp->ocm bank 1
   fb_write_reg32(p_config + A_WEIGHTS_BASE, fb_addr_64to32(mem_phy.w));  // Base adddr weights
-  fb_write_reg32(p_config + A_BUNDLE_DONE , 1);  // Bundle done writing (pixel dma waits for this)
   fb_write_reg32(p_config + A_N_BUNDLES_1 , N_BUNDLES);  // Number of bundles
-  fb_write_reg32(p_config + A_W_DONE      , 0);  // Weigths done
-  fb_write_reg32(p_config + A_X_DONE      , 0);  // Bundle done
-  fb_write_reg32(p_config + A_O_DONE      , 0);  // Output done
 
   // Write into BRAM the config for controller
   i32 parameters[8*N_BUNDLES];
@@ -141,7 +104,7 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
   fb_write_reg32(p_writeback + WB_A_N_BUNDLES_1, N_BUNDLES-1);
   int val = fb_read_reg32(p_writeback + WB_A_N_BUNDLES_1);
 
-  int32_t wb_bundles [N_BUNDLES][32] = {{0}};
+  int32_t wb_bundles [N_BUNDLES][WB_BUNDLE_WORDS] = {{0}};
   
   for (int ib = 0; ib < N_BUNDLES; ib++){
     wb_bundles[ib][0]= bundles[ib].p-1;
@@ -176,6 +139,18 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
     wb_bundles[ib][28] = bundles[ib].add_in_buffer_idx == -1 ? -1 : bundles[ib].add_in_buffer_idx * NHWC_WORDS;  // PL residual add: buffer base (-1 = none)
     wb_bundles[ib][29] = (bundles[ib].aa_nzero != 0) | ((bundles[ib].aa_shift & 0xFF) << 8) | ((bundles[ib].aa_pl_scale & 0xFF) << 16);
     wb_bundles[ib][30] = -(1 << (X_BITS - bundles[ib].aa_pl_scale - 1));  // residual-add clip min
+    // Words 32..40: where and how the PL writes this bundle's output (layout: see the comment above ram_out_base in writeback.sv)
+    const Bundle_t *pn = bundles[ib].ib_out == -1 ? &bundles[ib] : &bundles[bundles[ib].ib_out];   // bundle that reads this output (tiling of its input)
+    const int is_last = (ib == N_BUNDLES-1);
+    wb_bundles[ib][32] = is_last ? fb_addr_64to32(mem_phy.y) : (bundles[ib].ib_out == -1 ? 0 : fb_addr_64to32(mem_phy.out_buffers[bundles[ib].out_buffer_idx]));
+    wb_bundles[ib][33] = bundles[ib].o_bytes;
+    wb_bundles[ib][34] = (bundles[ib].oh & 0xFFFF) | ((bundles[ib].ow & 0xFFFF) << 16);
+    wb_bundles[ib][35] = bundles[ib].oc;
+    wb_bundles[ib][36] = (pn->l & 0xFFFF) | ((pn->w & 0xFFFF) << 16);
+    wb_bundles[ib][37] = (pn->cm & 0xFFFF) | ((pn->cm_p0 & 0xFFFF) << 16);
+    wb_bundles[ib][38] = pn->xp_words;
+    wb_bundles[ib][39] = (bundles[ib].ib_out != -1) | ((bundles[ib].is_flatten != 0) << 1) | (is_last << 2) | ((pn->x_pad & 0xFF) << 8);
+    wb_bundles[ib][40] = bundles[ib].add_out_buffer_idx == -1 ? -1 : bundles[ib].add_out_buffer_idx * NHWC_WORDS;
     wb_bundles[ib][31] = (bundles[ib].add_val_shift & 0xFF) | ((bundles[ib].add_a_shift & 0xFF) << 8) | ((bundles[ib].is_softmax != 0) << 16) | ((ib != N_BUNDLES-1) << 17) | ((bundles[ib].sm_shift & 0xF) << 20) | ((bundles[ib].sm_out_frac & 0xF) << 24);  // residual-add operand alignment shifts | bit16: PL softmax, bit17: quantize its output for the next bundle, 20-23: exp table shift, 24-27: output fraction bits
   }
   
@@ -196,273 +171,39 @@ extern EXT_C void model_setup(Memory_st *restrict mp) {
   fb_write_reg32(p_writeback + WB_A_START, 1);
 }
 
-// Helper functions
-
-
-static inline void write_flush_u8(u8*restrict addr, u8 val) {
-  *addr = val; // Leave flushing to the end of bundle
-}
-
-#define flatten_nhwc(in,ih,iw,ic, N,H,W,C, optional_debug_info,...)\
-  ((in*H + ih)*W + iw)*C + ic;\
-  assert_printf (in, <, N, optional_debug_info,__VA_ARGS__); assert_printf (ih, <, H, optional_debug_info,__VA_ARGS__); assert_printf (iw, <, W, optional_debug_info,__VA_ARGS__); assert_printf (ic, <, C, optional_debug_info,__VA_ARGS__); assert_printf ((((in*H + ih)*W + iw)*C + ic), <, NHWC_WORDS, optional_debug_info,__VA_ARGS__);
-
-#define max(x, y) ((x) > (y) ? (x) : (y))
-#define min(x, y) ((x) < (y) ? (x) : (y))
-#define clip(x, xmin, xmax) (((x) < (xmin)) ? (xmin) : ((x) > (xmax)) ? (xmax) : (x))
-#define shift_round(n, s) (((n) + ((s)>0 ? (1<<((s)-1)) - (~((n)>>(s))&1) : 0)) >> s) // === np.around(n/2**s).astype(i32)
-#define div_round(a, b) (((a)+((b)/2) - (~((b)|(a)/(b)) &1))/(b))
-
-
-static inline i32 quant_lrelu(i32 x, i8 nzero, i8 shift, i8 pl_scale){
-  x = x < 0 ? (nzero ? x: 0) : x << pl_scale; // Conditional, targeting ARM
-  x = shift_round(x, shift);
-  x = clip(x, -(1<<(X_BITS-pl_scale-1)), (1<<(X_BITS-1))-1);
-  return x;
-}
-
-
-static inline void write_x(i8 val, i8 *restrict p_out_buffer, Memory_st *restrict mp, i32 ib, i32 ixp, i32 ixn, i32 ixl, i32 ixw, i32 ixcm, i32 ixr, Bundle_t *restrict pb_out, i32 xcm) {
-
-  #define WRITEX_DEBUG_INFO "--- ib:%d ixp:%d ixn:%d ixl:%d ixw:%d ixcm:%d ixr:%d xcm :%d \n",ib,ixp,ixn,ixl,ixw,ixcm,ixr,xcm
-  assert_printf (ixr , <, PE_ROWS+pb_out->x_pad, "write_x", WRITEX_DEBUG_INFO);
-  assert_printf (ixcm, <, xcm          , "write_x", WRITEX_DEBUG_INFO);
-  assert_printf (ixw , <, pb_out->w    , "write_x", WRITEX_DEBUG_INFO);
-  assert_printf (ixl , <, pb_out->l    , "write_x", WRITEX_DEBUG_INFO);
-  assert_printf (ixn , <, pb_out->n    , "write_x", WRITEX_DEBUG_INFO);
-  assert_printf (ixp , <, pb_out->p    , "write_x", WRITEX_DEBUG_INFO);
-
-  i32 p_offset       = (ixp == 0) ? 0 : (pb_out->cm_p0 + (ixp-1)*pb_out->cm) * pb_out->xp_words;
-  i32 flat_index_n2r = (((ixn*pb_out->l + ixl)*pb_out->w + ixw)*xcm + ixcm)*(PE_ROWS+pb_out->x_pad) + ixr; // multidim_index -> flat_index [n,l,w,cm,r]
-  i32 flat_index     = p_offset + flat_index_n2r;
-
-#ifdef XDEBUG
-  mp->debug_tiled[flat_index] = val;
-#endif
-
-  // Pack bits and store
-  idiv_t packed_idx = idiv(flat_index, X_WORDS_PER_BYTE);
-  assert_printf (packed_idx.quot , <, bundles[ib].o_bytes, "write_x", WRITEX_DEBUG_INFO);
-
-  u8 packed_val      = ((u8)val & X_BITS_MASK) << (packed_idx.rem * X_BITS);
-  u8 mem_val         = p_out_buffer[packed_idx.quot];
-  u8 mem_val_cleaned = X_POSITION_INVERTED_MASKS[packed_idx.rem] & mem_val;
-  write_flush_u8((u8*)(p_out_buffer + packed_idx.quot), mem_val_cleaned | packed_val);
-}
-
-
-static inline void tile_write( i32 out_val, i8 *restrict p_out_buffer, i32 ib, Bundle_t *restrict pb, Memory_st *restrict mp, i32 i_yn, i32 i_yh, i32 i_yw, i32 i_yc, i32 yn, i32 yh, i32 yw, i32 yc ) {
-
-  // ------ FLATTEN ------
-  if (pb->is_flatten) {
-    i_yc = (i_yh*yw + i_yw)*yc + i_yc;  // (H*W*C) -> C
-    i_yw = 0;                           // W=1
-    i_yh = i_yn;                        // N -> H
-    i_yn = 0;                           // N=1
-
-    yc = yh*yw*yc;
-    yw = 1;
-    yh = yn;
-    yn = 1;
-  }
-
-  i32 iy_nhwc = flatten_nhwc(i_yn,i_yh,i_yw,i_yc, pb->on,pb->oh,pb->ow,pb->oc,,);
-#ifdef XDEBUG
-  mp->debug_nhwc[iy_nhwc] = out_val;
-#endif
- // ------ STORE IN NHWC  ------
-
-  if (ib == N_BUNDLES-1) {
-    // Last bundle: save as NHWC. The PL softmax hands out Q24 probabilities -> float
-    if (pb->is_softmax) mp->y[iy_nhwc] = (f32__)out_val / (f32__)(1 << SM_FRAC_BITS);
-    else                mp->y[iy_nhwc] = out_val;
-    return;
-  }
-
-  // Store for residual add (into the PL add RAM)
-  if (pb->add_out_buffer_idx != -1)
-    fb_write_reg32(p_writeback + WB_ADD_BASE + pb->add_out_buffer_idx * NHWC_WORDS + iy_nhwc, (i32)(i8)out_val);
-
-  // If output only goes to residual add, early return
-  Bundle_t*restrict pb_out;
-  if (pb->ib_out == -1)
-    return;
-  else
-    pb_out = &bundles[pb->ib_out];
-    
-
-  // ------ TILING: Calculate X coordinates ------
-  // y [n,h,w,c] -> x[p, n, l, w,cmp, r+pad]
-
-  i8 yp_first  = i_yc < pb_out->cm_p0;
-
-  idiv_t div_oh  = idiv(i_yh, PE_ROWS);
-  i32   i_yr    = div_oh.rem;
-  i32   i_yl    = div_oh.quot;
-
-  idiv_t div_oc    = idiv(i_yc-pb_out->cm_p0, pb_out->cm);
-  i32   i_yp      = yp_first ? 0             : div_oc.quot + 1;
-  i32   i_ycm     = yp_first ? i_yc          : div_oc.rem;
-  i32   ycm       = yp_first ? pb_out->cm_p0 : pb_out->cm  ;
-
-  // ------ STORE FOR NEXT BUNDLE  ------
-  // Other bundles: pad & save as tiled
-  i32 yr_sweep = i_yh==yh-1 ? PE_ROWS : i_yr + 1;
-
-  for (i32 i_yr_dest = i_yr; i_yr_dest < yr_sweep; i_yr_dest++) {
-    write_x(out_val, p_out_buffer, mp, ib, i_yp, i_yn, i_yl, i_yw, i_ycm, i_yr_dest,   pb_out, ycm);
-
-    // --- PADDING: the [bottom x_pad rows of previous block (l-1)] with [first x_pad rows of this block (l)]
-    if (i_yr_dest < pb_out->x_pad) {
-      i32 pad_val = (i_yl == 0) ? 0         : out_val;
-      i32 dest_yl = (i_yl == 0) ? pb_out->l-1 : i_yl-1;
-      write_x(pad_val, p_out_buffer, mp, ib, i_yp, i_yn, dest_yl, i_yw, i_ycm, i_yr_dest+PE_ROWS,   pb_out, ycm);
-    }
-    out_val = 0;
-  }
-  
-}
-
-
-
-
-
-
 extern EXT_C void run(Memory_st *restrict mp) {
 
-
-  static Bundle_t *restrict pb = &bundles[0];
-  static i32 ib=0;
-  static i8 *restrict p_out_buffer = 0;
-
-  i32   bundle_counter;
-  i32   bundle_limit;
-
-  static i8 ocm_bank = 0; 
-
-  model_setup(mp);
-
-  fb_write_reg32(p_config + A_START, 1); 
-  bundle_counter = 0;
-  i32 done;
-  i32 out_val=0;
-  i32 yh;
-  i32 yw;
-  i32 i_yn;
-  i32 i_yh;
-  i32 i_yw;
-  i32 i_yc;
-  i32 yn;
-  i32 yc;
-  i32 status;
-  i32 ov;
-  i32 v;
-  i32 pk; 
-  i32 pk2;
-
-
-  pb = &bundles[ib];
-  bundle_limit = pb->p * pb->t * pb->n * pb->l * pb->w_kw2;
-  p_out_buffer = (i8*)&(mp->out_buffers[pb->out_buffer_idx]);
-  yn = pb->n;
-  yc = pb->co;
-  yh   = pb->ch;
-  yw   = pb->cw;
-
-
-  while(1) {
-
-    while (!((status = fb_read_reg32(p_writeback + WB_A_BUNDLE_STATUS)) & 0x1)) {
-    }
-    done = (status >> 1) & 0x1;
-    bundle_counter++;
-    fb_write_reg32(p_config + A_DONE_WRITE + ocm_bank, 0);
-
-
-    while (1) {
-
-PROCESS_AND_STORE_DONE:
-
-      while ((ov = fb_read_reg32(p_writeback + WB_A_OUT_FLAGS)) & 0x80000000) { 
-        if (ov & 0x40000000) goto BUNDLE_DONE;                      
-      }
-      v       = ov & 0x3FFFFFFF;
-      out_val = (v ^ 0x20000000) - 0x20000000;
-
-      pk      = fb_read_reg32(p_writeback + WB_A_PIXEL_PACK);
-      i_yn    =  pk         & 0x1F;       
-      i_yh    = (pk >> 5)   & 0x3FF;    
-
-      pk2 = fb_read_reg32(p_writeback + WB_A_PIXEL_PACK2);
-      i_yw = pk2 & 0x3FF;       
-      i_yc = (pk2 >> 10) & 0x3FFFFF;
-
-      fb_write_reg32(p_writeback + WB_A_ADDR_EN_COUNTER, 1);
-
-      // The PL does MAX/AVG pooling and its activation: for a pooled bundle (i_yh, i_yw) is already the pooled pixel (ixh, ixw)
-      if (pb->pool == POOL_NONE)
-        tile_write(out_val, p_out_buffer, ib, pb, mp, i_yn, i_yh, i_yw, i_yc, yn, yh,     yw,     yc);
-      else
-        tile_write(out_val, p_out_buffer, ib, pb, mp, i_yn, i_yh, i_yw, i_yc, yn, pb->ph, pb->pw, yc);
-  }
-  BUNDLE_DONE:
-  fb_write_reg32(p_writeback + WB_A_ADDR_DONE, 0);
-
-  if (ocm_bank){
-    fb_write_reg32(p_writeback + WB_A_DONE_WRITE_1, 0);
-  }
-  else{
-    fb_write_reg32(p_writeback + WB_A_DONE_WRITE_0, 0);
-  }     
-  fb_write_reg32(p_config + A_DONE_READ + ocm_bank, 1);       
-  fb_write_reg32(p_writeback + WB_A_EN_COUNT, 1);
-              
+  model_setup(mp);                            // weights, bias, bundle headers, exp table -> PL
+  fb_write_reg32(p_config + A_START, 1);      // from here the PL does everything: DMAs, conv, bias, activation, residual, softmax, pooling,
+                                              // tiling of the outputs into DDR for the next bundle, final y.
 
 #ifdef SIM
-    char f_path_debug [1000];
-    sprintf(f_path_debug, "%s/%0d_y_nhwc_sim.txt", DATA_DIR, ib);
-    FILE *fp_debug = fopen(f_path_debug, "w");
-    for (i32 i=0; i<pb->debug_nhwc_words; i++)
-      sim_fprintf(fp_debug,"%d\n", mp->debug_nhwc[i]);
-    fclose(fp_debug);
-
-    char f_path_tiled [1000];
-    sprintf(f_path_tiled, "%s/%0d_y_tiled_sim.txt", DATA_DIR, ib);
-    FILE *fp_tiled = fopen(f_path_tiled, "w");
-    for (i32 i=0; i<pb->o_words; i++)
-      if (ib == N_BUNDLES-1) sim_fprintf(fp_tiled,"%d\n", pb->is_softmax ? (i32)(mp->y[i] * (1 << SM_FRAC_BITS)) : (i32)mp->y[i]);
-      else sim_fprintf(fp_tiled,"%d\n", mp->debug_tiled[i]);
-    fclose(fp_tiled);
-
-    if (ib != N_BUNDLES-1){
-      char f_path_packed [1000];
-      sprintf(f_path_packed, "%s/%0d_y_packed_sim.bin", DATA_DIR, ib);
-      FILE *fp_packed = fopen(f_path_packed, "wb");
-      fwrite(p_out_buffer, 1, pb->o_bytes, fp_packed);
-      fclose(fp_packed);
-    }
+  // Simulation only: dump what the PL has put in DDR, bundle by bundle, for the python checks. The out buffers are reused every N_OUT_BUF
+  // bundles, so each one is dumped as soon as the PL reports the bundle as complete (WB_A_BUNDLES_DONE).
+  for (i32 ib = 0; ib < N_BUNDLES-1; ib++) {
+    if (bundles[ib].ib_out == -1) continue;
+    while ((i32)fb_read_reg32(p_writeback + WB_A_BUNDLES_DONE) <= ib) {}
+    char f_path_packed [1000];
+    sprintf(f_path_packed, "%s/%0d_y_packed_sim.bin", DATA_DIR, ib);
+    FILE *fp_packed = fopen(f_path_packed, "wb");
+    fwrite(mp->out_buffers[bundles[ib].out_buffer_idx], 1, bundles[ib].o_bytes, fp_packed);
+    fclose(fp_packed);
+  }
 #endif
 
-  if (done) {
-    ocm_bank ^= 1;
-    break;
-  }
+  while (!(fb_read_reg32(p_writeback + WB_A_ALL_DONE) & 1)) {}     // the last y word is in DDR
 
-  if(bundle_counter == bundle_limit){
-    flush_cache(p_out_buffer, pb->o_bytes);
-    fb_write_reg32(p_config + A_BUNDLE_DONE, 1);
-    bundle_counter = 0;
-    ib++;
-    pb = &bundles[ib];
-    bundle_limit = pb->p * pb->t * pb->n * pb->l * pb->w_kw2;
-    p_out_buffer = (i8*)&(mp->out_buffers[pb->out_buffer_idx]);
-    yn = pb->n;
-    yc = pb->co;
-    yh   = pb->ch;
-    yw   = pb->cw;
-  };
-  ocm_bank ^= 1;
-  } // first while
+#ifdef SIM
+  {
+    const Bundle_t *pb = &bundles[N_BUNDLES-1];
+    char f_path_y [1000];
+    sprintf(f_path_y, "%s/%0d_y_tiled_sim.txt", DATA_DIR, N_BUNDLES-1);
+    FILE *fp_y = fopen(f_path_y, "w");
+    for (i32 i=0; i<pb->o_words; i++)
+      sim_fprintf(fp_y,"%d\n", pb->is_softmax ? (i32)(mp->y[i] * (1 << SM_FRAC_BITS)) : (i32)mp->y[i]);
+    fclose(fp_y);
+  }
+#endif
 }
 
 extern EXT_C void print_output (Memory_st *restrict mp) {

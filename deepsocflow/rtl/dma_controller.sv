@@ -65,25 +65,39 @@ module dma_controller #(
   output logic                       m_wd_valid,
   input  logic                       m_wd_ready,
 
-  output logic                          o_ready
+  output logic                          o_ready,
+
+  // AXI4 write master (output buffers / final y in DDR), driven by the writeback
+  output logic                          m_aw_valid,
+  input  logic                          m_aw_ready,
+  output logic [AXI_ADDR_WIDTH-1:0]     m_aw_addr ,
+  output logic [7:0]                    m_aw_len  ,
+  output logic                          m_w_valid ,
+  input  logic                          m_w_ready ,
+  output logic [AXI_WIDTH-1:0]          m_w_data  ,
+  output logic [AXI_WIDTH/8-1:0]        m_w_strb  ,
+  output logic                          m_w_last  ,
+  input  logic                          m_b_valid ,
+  output logic                          m_b_ready
 );
+  // Raw output banks (ping-pong in the writeback): the DMA may fill a bank only when the writeback has consumed it (done_read).
+  // done_read[b] is cleared when the DMA has written bank b, and set by the writeback when it has consumed it (rel_valid / rel_bank).
+  logic [1:0] done_read;
+  logic       bundle_done_q;        // the outputs of the previous bundle are in DDR: the pixel DMA may read the next bundle
+  logic       wb_rel_valid, wb_rel_bank, wb_bundle_done;
+
   logic o_ready_gated;
-  assign o_ready_gated = ~((o_last || got_o_last) && ~cfg[A_DONE_READ+ocm_idx][0]);
+  assign o_ready_gated = ~((o_last || got_o_last) && ~done_read[ocm_idx_1]);
   
   localparam WORDS_IN_CFG = 1024 / (AXI_DATA_WIDTH/8); // 1024 bytes = 256 words for cfg + SRAM
   localparam // Addresses for local memory 0:15 is registers, rest is SRAM
     A_START        = 'h0,
-    A_DONE_READ    = 'h1, // 2
-    A_DONE_WRITE   = 'h3, // 2
-    A_OCM_BASE     = 'h5, // 2
-    A_WEIGHTS_BASE = 'h7,
-    A_BUNDLE_DONE  = 'h8,
-    A_N_BUNDLES_1  = 'h9,
-    A_W_DONE       = 'hA, // W,X,O done are written by PL, read by PS to debug which one hangs
-    A_X_DONE       = 'hB, 
-    A_O_DONE       = 'hC
+    A_WEIGHTS_BASE = 'h1,
+    A_N_BUNDLES_1  = 'h2,
+    A_W_DONE       = 'h3, // W,X done are written by PL, read by PS to debug which one hangs
+    A_X_DONE       = 'h4
     ; // Max 16 registers
-  logic [12:0][AXI_DATA_WIDTH-1:0] cfg ;
+  logic [4:0][AXI_DATA_WIDTH-1:0] cfg ;
 
 
   assign reg_wr_ack = 1'b1;
@@ -142,7 +156,10 @@ module dma_controller #(
     .ADD_WORDS      (`ADD_WORDS     ),
     .SM_WORDS       (`SOFTMAX_WORDS ),
     .POOL_WORDS     (`POOL_WORDS    ),
-    .SM_TAB_N       (`SOFTMAX_TAB_N )
+    .SM_TAB_N       (`SOFTMAX_TAB_N ),
+    .TILE_WORDS     (`TILE_WORDS    ),
+    .X_BITS         (`X_BITS        ),
+    .MAX_BURST      (`AXI_MAX_BURST_LEN)
   ) WB (
     .clk        (clk                     ),
     .rstn       (rstn                    ),
@@ -157,7 +174,21 @@ module dma_controller #(
     .out_tready_effective (o_ready_gated ),
     .out_tkeep  ({(AXI_WIDTH/8){1'b1}}   ),
     .out_tready (o_ready                 ),
-    .out_tlast  (o_last                  )   
+    .out_tlast  (o_last                  ),
+    .m_aw_valid (m_aw_valid              ),
+    .m_aw_ready (m_aw_ready              ),
+    .m_aw_addr  (m_aw_addr               ),
+    .m_aw_len   (m_aw_len                ),
+    .m_w_valid  (m_w_valid               ),
+    .m_w_ready  (m_w_ready               ),
+    .m_w_data   (m_w_data                ),
+    .m_w_strb   (m_w_strb                ),
+    .m_w_last   (m_w_last                ),
+    .m_b_valid  (m_b_valid               ),
+    .m_b_ready  (m_b_ready               ),
+    .rel_valid  (wb_rel_valid            ),
+    .rel_bank   (wb_rel_bank             ),
+    .bundle_done(wb_bundle_done          )
   );
   always_comb begin
     wb_reg_wr_en   = reg_wr_en && (reg_wr_addr >= WORDS_IN_CFG);
@@ -250,7 +281,7 @@ module dma_controller #(
     unique case (x_state)
       X_IDLE      : if (cfg[A_START][0])       x_state_next = X_WAIT_RAM;
       X_WAIT_RAM  : if (x_ram_rd_valid)         x_state_next = X_WAIT_WRITE;
-      X_WAIT_WRITE: if (cfg[A_BUNDLE_DONE][0]) x_state_next = X_EXEC;
+      X_WAIT_WRITE: if (bundle_done_q)         x_state_next = X_EXEC;
       X_EXEC      : if (lc_xb)                  x_state_next = X_IDLE; // all bundles done, idle
                     else if (lc_xp)             x_state_next = X_WAIT_RAM; // this bundle done, request next bundle params
     endcase
@@ -299,15 +330,12 @@ module dma_controller #(
   always_ff @(posedge clk) // All cfg written in this always block
     if (!rstn) begin 
       cfg[A_START       ] <= 0; 
-      cfg[A_DONE_READ +0] <= 32'd1;
-      cfg[A_DONE_READ +1] <= 32'd1;
-      cfg[A_OCM_BASE  +0] <= 32'd0;
-      cfg[A_OCM_BASE  +1] <= 32'd0;
       cfg[A_WEIGHTS_BASE] <= 32'd0;
-      cfg[A_BUNDLE_DONE ] <= 32'd1;
       cfg[A_N_BUNDLES_1 ] <= 32'd0;
       cfg[A_W_DONE      ] <= 32'd0;
       cfg[A_X_DONE      ] <= 32'd0;
+      done_read     <= 2'b11;
+      bundle_done_q <= 1'b1;
 
       ocm_idx     <= 0; 
       got_o_last  <= 0; // to say first o_bpt comes from engine is for new data
@@ -315,47 +343,41 @@ module dma_controller #(
 
       if (o_valid && o_ready_gated && o_last) begin // previous packet completed(AXIS from engine to DMA) , only @ 1 cycle
         got_o_last <= 1;
-        cfg[A_DONE_READ+ocm_idx] <= 0;
+        done_read[ocm_idx_1] <= 1'b0;
       end
 
 
       if (got_o_last) begin // DMA wants descriptor + o_bpt from engine is valid + o_bpt is for new data
-        if (cfg[A_DONE_READ+ocm_idx_next][0]) begin  // wait for NEXT bank to done reading
+        if (done_read[ocm_idx_next[0]]) begin  // wait for NEXT bank to done reading
           ocm_idx    <= ocm_idx_next;   // switch bank in next clock
           got_o_last <= 0;
         end
       end
-   
+
+      if (wb_rel_valid) done_read[wb_rel_bank] <= 1'b1;   // writeback has consumed this bank
 
 
     // --------------------------------- OTHER REGISTERS -----------------------------------
 
       //
-      if (cfg[A_START][0]) 
-        cfg[A_START] <= 0; // written by PS after all config, stays high for only 1 clock
+      if (cfg[A_START][0]) begin
+        cfg[A_START]  <= 0; // written by PS after all config, stays high for only 1 clock
+        done_read     <= 2'b11;   // both raw banks are free
+        bundle_done_q <= 1'b1;    // the first bundle reads its pixels at once
+      end
 
-      if (cfg[A_BUNDLE_DONE][0] && x_state == X_WAIT_WRITE) // stays high until sampled by x_state
-        cfg[A_BUNDLE_DONE] <= 0; 
+      if (bundle_done_q && x_state == X_WAIT_WRITE) // stays high until sampled by x_state
+        bundle_done_q <= 0; 
+      if (wb_bundle_done)                           // the writeback has put the outputs of a bundle in DDR
+        bundle_done_q <= 1;
 
       cfg[A_W_DONE] <= AXI_DATA_WIDTH'(w_state == W_IDLE);
       cfg[A_X_DONE] <= AXI_DATA_WIDTH'(x_state == X_IDLE);
 
 
       //reg_wr_ack <= reg_wr_en; // Write has 1 clock latency
-      if (reg_wr_en && reg_wr_addr < 16) // PS has priority in writing to registers
+      if (reg_wr_en && reg_wr_addr < 5) // PS has priority in writing to registers
         cfg[reg_wr_addr] <= reg_wr_data;
     end
 
-    wire        cfg_A_START        = 1'(cfg[A_START       ]); 
-    wire        cfg_A_DONE_READ_0  = 1'(cfg[A_DONE_READ +0]);  // 2
-    wire        cfg_A_DONE_READ_1  = 1'(cfg[A_DONE_READ +1]);  // 2
-    wire [31:0] cfg_A_OCM_BASE_0   =    cfg[A_OCM_BASE  +0];   // 2
-    wire [31:0] cfg_A_OCM_BASE_1   =    cfg[A_OCM_BASE  +1];   // 2
-    wire [31:0] cfg_A_WEIGHTS_BASE =    cfg[A_WEIGHTS_BASE]; 
-    wire        cfg_A_BUNDLE_DONE  = 1'(cfg[A_BUNDLE_DONE ]); 
-    wire        cfg_A_N_BUNDLES_1  = 1'(cfg[A_N_BUNDLES_1 ]); 
-    wire        cfg_A_W_DONE       = 1'(cfg[A_W_DONE      ]); 
-    wire        cfg_A_X_DONE       = 1'(cfg[A_X_DONE      ]);  
-    wire        cfg_A_O_DONE       = 1'(cfg[A_O_DONE      ]); 
-
-endmodule
+endmodule

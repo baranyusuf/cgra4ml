@@ -16,10 +16,13 @@ module writeback #(
     SM_WORDS        = 1    ,  // output words of the softmax bundle (logit / probability RAM)
     SM_TAB_N        = 2220 ,  // entries of the softmax exp table
     POOL_WORDS      = 1    ,  // conv-output words of the largest pooled bundle (pool RAM, bytes)
+    TILE_WORDS      = 1    ,  // elements of the largest tiled output (tile RAM, X_BITS each)
+    X_BITS          = 4    ,  // bits per element of the tiled output
+    MAX_BURST       = 16   ,  // beats per AXI write burst
 
   localparam  
     WIDTH              = 32  ,
-    VAR_PER_ROW        = 32   ,
+    VAR_PER_ROW        = 64   ,   // words per bundle in the bundle SRAM (see the list below)
     SRAM_RD_DATA_WIDTH = VAR_PER_ROW * WIDTH,
     SRAM_WR_DEPTH = SRAM_RD_DEPTH * SRAM_RD_DATA_WIDTH / WIDTH, // 2048
     SRAM_RD_ADDR_WIDTH  = $clog2(SRAM_RD_DEPTH), // 11
@@ -45,6 +48,24 @@ module writeback #(
 
   // This signal is coming from one module above
   input out_tready_effective                   ,
+
+  // AXI4 write master: tiled outputs of the bundles / final y to DDR
+  output logic                       m_aw_valid ,
+  input  logic                       m_aw_ready ,
+  output logic [AXI_ADDR_WIDTH-1:0]  m_aw_addr  ,
+  output logic [7:0]                 m_aw_len   ,
+  output logic                       m_w_valid  ,
+  input  logic                       m_w_ready  ,
+  output logic [AXI_WIDTH-1:0]       m_w_data   ,
+  output logic [AXI_WIDTH/8-1:0]     m_w_strb   ,
+  output logic                       m_w_last   ,
+  input  logic                       m_b_valid  ,
+  output logic                       m_b_ready  ,
+
+  // Flow control towards the DMA controller (done in the PL)
+  output logic                       rel_valid  ,   // 1 clock: a raw bank has been consumed (the DMA may overwrite it)
+  output logic                       rel_bank   ,   // ... this one
+  output logic                       bundle_done,   // 1 clock: all outputs of a bundle are in DDR (the pixel DMA may read the next bundle)
 
 
   // AXIS slave interface 
@@ -373,6 +394,21 @@ module writeback #(
   logic [WIDTH-1:0] ram_is_bias , ram_b_val_shift, ram_b_bias_shift;
   logic [WIDTH-1:0] ram_ca_nzero, ram_ca_shift, ram_ca_pl_scale, ram_clip_min, ram_clip_max;
   logic [WIDTH-1:0] ram_add_base, ram_aa_pack, ram_aa_clip_min, ram_add_shifts;
+  // Words 32..40 of the bundle header: where and how the tile writer stores this bundle's output
+  //   32 out_base   DDR byte address of the output buffer (last bundle: y)
+  //   33 out_bytes  bytes of the tiled output
+  //   34 [15:0] oh  [31:16] ow     NHWC dims of the stored output
+  //   35 oc
+  //   36 [15:0] nx_l  [31:16] nx_w      tiling of the NEXT bundle's input (blocks, width)
+  //   37 [15:0] nx_cm [31:16] nx_cm_p0  channels per p pass of the next bundle (later passes, first pass)
+  //   38 nx_xpw     words per channel (xp_words) of the next bundle
+  //   39 flags: [0] has_next  [1] is_flatten  [2] is_last  [15:8] x_pad of the next bundle
+  //   40 add_out    residual add RAM base of this bundle's output (-1: none)
+  logic [WIDTH-1:0] ram_out_base, ram_out_bytes, ram_ohw, ram_oc, ram_nx_lw, ram_nx_cm, ram_nx_xpw, ram_flags, ram_add_out;
+  wire              ram_has_next   = ram_flags[0];
+  wire              ram_is_flatten = ram_flags[1];
+  wire              ram_is_last    = ram_flags[2];
+  wire [7:0]        ram_x_pad      = ram_flags[15:8];
   wire              ram_is_softmax = ram_add_shifts[16]; // bundle word 31 bit 16: this bundle's outputs go through the PL softmax
   // Pooling parameters sit in the unused upper bits of the header words 20..25 (the low byte of each word keeps its old field):
   //   word 20 [9:8] pool mode (0 none, 1 max, 2 avg)
@@ -391,7 +427,8 @@ module writeback #(
   wire [4:0]        ram_pa_pl_scale = ram_ca_pl_scale[12:8];
   wire [9:0]        ram_pw          = ram_ca_pl_scale[25:16];
 
-  localparam ACTUAL_READ_WIDTH = 32 * WIDTH;
+  localparam HDR_WORDS = 41;                       // words of a bundle header that are used (VAR_PER_ROW are reserved)
+  localparam ACTUAL_READ_WIDTH = HDR_WORDS * WIDTH;
   assign ram_rd_addr = SRAM_RD_ADDR_WIDTH'(i_b);
   wire last_wkw2_now = (i_wkw2 == ram_max_wkw2);  
   wire [WIDTH-1:0] w_last_hw = last_wkw2_now ? ((ram_kw >> 1) + 32'd1) : 32'd1;
@@ -401,7 +438,8 @@ module writeback #(
     if (!rstn) ram_rd_data_q <= '0;
     else       ram_rd_data_q <= ram_rd_data; 
 
-  assign {ram_add_shifts, ram_aa_clip_min, ram_aa_pack, ram_add_base,
+  assign {ram_add_out, ram_flags, ram_nx_xpw, ram_nx_cm, ram_nx_lw, ram_oc, ram_ohw, ram_out_bytes, ram_out_base,
+          ram_add_shifts, ram_aa_clip_min, ram_aa_pack, ram_add_base,
           ram_clip_max, ram_clip_min, ram_ca_pl_scale, ram_ca_shift, ram_ca_nzero,
           ram_b_bias_shift, ram_b_val_shift, ram_is_bias,
           ram_pe_mod, ram_pe_div,
@@ -550,24 +588,20 @@ module writeback #(
   );
 
   // ---- RESIDUAL ADD (PL): out = quant_lrelu(act1 + add_buffer[iy_nhwc], aa_*) ----
-  // add RAM (bytes) is filled by the PS over AXI-Lite (window starts at ADD_BASE) with the
+  // add RAM (bytes) is filled by the tile writer (wb_tilewr) with the
   // outputs of earlier bundles. ram_add_base = buffer_idx*NHWC_WORDS, or -1 when this bundle
   // has no residual add. Without residual add the value goes through a pass-through
   // quant_lrelu (nzero=1, shift=0, pl_scale=0, clip = full range), so latency stays constant.
   logic                   add_wr_en;
   logic [ADD_ADDR_W-1:0]  add_wr_addr, add_rd_addr;
-  logic [7:0]             add_rd_q;
-  always_comb begin
-    add_wr_en   = reg_wr_en && (reg_wr_addr >= ADD_BASE) && (reg_wr_addr < SM_TAB_BASE);
-    add_wr_addr = ADD_ADDR_W'(reg_wr_addr - ADD_BASE);
-    add_rd_addr = ADD_ADDR_W'(ram_add_base + iy_nhwc_conv);
-  end
+  logic [7:0]             add_wr_data, add_rd_q;
+  always_comb add_rd_addr = ADD_ADDR_W'(ram_add_base + iy_nhwc_conv);
 
   ram_sdp_simple #(
     .WIDTH (8), .DEPTH ((ADD_WORDS > 0) ? ADD_WORDS : 1), .ADDRW (ADD_ADDR_W)
   ) ADD_RAM (
     .clkA (clk), .clkB (clk),
-    .weA  (add_wr_en), .enaA (add_wr_en), .addrA (add_wr_addr), .diA (reg_wr_data[7:0]),
+    .weA  (add_wr_en), .enaA (add_wr_en), .addrA (add_wr_addr), .diA (add_wr_data),
     .enaB (1'b1), .addrB (add_rd_addr), .doB (add_rd_q)
   );
 
@@ -598,19 +632,18 @@ module writeback #(
   );
 
   // ---- SOFTMAX (PL): see wb_softmax.sv ----
-  // In a softmax bundle the PS never sees the logits. When a logit pixel becomes valid, the PL accepts it
-  // itself (sm_auto_ack = the ack the PS would have written to WB_A_ADDR_EN_COUNTER) and stores it in the
+  // In a softmax bundle, when a logit pixel becomes valid the PL accepts it itself (sm_auto_ack) and stores it in the
   // softmax unit. The class with index co-1 is the last one of its pixel -> starts max / exp / sum / divide.
-  // The result is then presented to the PS like any other output pixel (OUT_FLAGS / PIXEL_PACK / PIXEL_PACK2, one
-  // class per pixel), already rounded to the input format of the next bundle, so the PS just runs tile_write.
+  // The results go to the tile writer one class per item (already rounded to the input format of the next bundle,
+  // or converted to float for the last bundle).
   // New logit pixels are not accepted while the unit is working (the counters simply wait), and the
-  // done flag is hidden until the last result has been taken by the PS.
+  // done flag is hidden until the last result has been taken by the tile writer.
   // ---- Pipeline latencies (clocks), counted from en_counter_last (the counters move to the next pixel) ----
   //  data path of the new pixel:
   //    raw RAM:   i_sram_addr counter register (1) -> RAW RAM read (1)                      = LAT_ADDR_RD   = 2
   //    NHWC RAM:  pixel step (i_ir / i_iw_last / i_icoe move):
   //                 counter register (1) -> iyh_wco_q/iyw_co_q/iyc_sum1 (1) -> iy_nhwc_hw (1) -> NHWC RAM read (1)  = LAT_NHWC_RD   = 4
-  //               bank step (PS writes WB_A_EN_COUNT: i_wkw2 / i_l / i_n / i_t move, and the pixel counters restart):
+  //               bank step (EN_COUNT pulse from the bank release: i_wkw2 / i_l / i_n / i_t move, and the pixel counters restart):
   //                 counter register (1) -> il_dot_pe/coe_t_q/iyn_hwco_q (1) -> iyh_wco_q/iyc_sum1 (1) -> iy_nhwc_hw (1)
   //                 -> NHWC RAM read (1)                                                                          = LAT_NHWC_BANK = 5
   //               (the last pass of a p>1 layer adds the stored partial sum, so it needs the slower NHWC path)
@@ -631,8 +664,7 @@ module writeback #(
   //  After a bank step the flag is released by hold_invalid (HOLD_INV_DELAY clocks after WB_A_EN_COUNT) instead, the same rule:
   localparam             LAT_SUM_BANK   = (LAT_NHWC_BANK > LAT_ADDR_RD) ? LAT_NHWC_BANK : LAT_ADDR_RD;   // = 5
   localparam             HOLD_INV_DELAY = LAT_SUM_BANK + LAT_PIPE - LAT_TAIL;       // = 13
-  //  The PS used to wait for the raw bank to be written (BUNDLE_STATUS) before it looked at any pixel. The PL now does the
-  //  same: a pixel is accepted only when the raw bank that is being read has been written completely (DONE_WRITE_x).
+  //  A pixel is accepted only when the raw bank that is being read has been written completely (DONE_WRITE_x).
   //  The value is then ready LAT_RAM_WR_RD (RAM write -> read data) + LAT_PIPE clocks after the later of: flag low, bank written.
   localparam             LAT_RAM_WR_RD = 1;
   localparam             PX_SETTLE     = LAT_RAM_WR_RD + LAT_PIPE;                       // = 12
@@ -645,15 +677,22 @@ module writeback #(
   logic                  pool_idle, pool_em_valid, pool_done;
   logic [WIDTH-1:0]      sm_em_data, sm_em_k;
   wire                   px_valid = !px_not_ready && (px_vcnt == PX_VCNT_W'(PX_SETTLE)) && !cfg[WB_A_ADDR_DONE][0];   // outval_p has left the pipeline
+
+  // ---- Who takes the pixel (everything here is decided inside the PL, nobody reads the pixel any more) ----
+  //  plain bundle : the pixel goes to the tile writer (wb_tilewr)
+  //  softmax      : the logit goes to the softmax unit, the probabilities (em) go to the tile writer one class at a time
+  //  pooling      : the pixel goes to the pool unit, the pooled pixels (em) go to the tile writer
+  //  The pixel is accepted once (px_arm); the counters move on with ADDR_EN_COUNTER, which is set at the accept for a plain pixel / a
+  //  softmax logit, and when the pool unit has swept all windows of the pixel and the tile writer has taken every pooled pixel (pool_done).
+  logic                  tw_ready, tw_items_idle, tw_quiet, tw_fl_done;
   wire                   sm_auto_ack  = ram_is_softmax && px_arm && px_valid && sm_idle && !sm_em_valid;
-  // The PS acknowledges every emitted result (softmax class / pooled pixel) with a write to ADDR_EN_COUNTER, which must not move the counters.
-  wire                   em_any_valid = sm_em_valid || pool_em_valid;
-  wire                   em_ack_any   = reg_wr_en && (reg_wr_addr == WB_A_ADDR_EN_COUNTER) && reg_wr_data[0] && em_any_valid;
-  wire                   sm_em_ack    = em_ack_any && sm_em_valid;
-  wire                   pool_em_ack  = em_ack_any && pool_em_valid;
-  // Pooling: the pixel is accepted like a softmax logit, but the counters are held (no ack) until the pool unit has swept all
-  // windows of the pixel and the PS has taken every pooled pixel it emitted (pool_done), so the pixel's values stay stable meanwhile.
   wire                   pool_start   = ram_is_pool && px_arm && px_valid && pool_idle && !pool_em_valid;
+  wire                   plain_req    = !ram_is_softmax && !ram_is_pool && px_arm && px_valid;
+  wire                   tw_it_valid  = sm_em_valid || pool_em_valid || plain_req;
+  wire                   tw_take      = tw_it_valid && tw_ready;
+  wire                   sm_em_ack    = tw_take && sm_em_valid;
+  wire                   pool_em_ack  = tw_take && !sm_em_valid && pool_em_valid;
+  wire                   plain_ack    = tw_take && !sm_em_valid && !pool_em_valid;
   wire [21:0]            sm_cls       = pack2_p[31:10];                     // class index (iyc) of the pixel being accepted
   // The classes of a pixel arrive in ascending order (iyc = coe_t_q + i_icoe, both counters only count up, tiles t ascend),
   // so the logit of class co-1 is always the last one of its pixel and the pixel's logits end at its NHWC address.
@@ -667,7 +706,7 @@ module writeback #(
       if (px_not_ready)                        px_vcnt <= '0;
       else if (px_vcnt != PX_VCNT_W'(PX_SETTLE)) px_vcnt <= px_vcnt + PX_VCNT_W'(1);
       if (cfg[WB_A_ADDR_INVALID][0]) px_arm <= 1'b1;   // armed again once the counters have moved on
-      else if (sm_auto_ack || pool_start) px_arm <= 1'b0;   // one pixel is accepted once
+      else if (sm_auto_ack || pool_start || plain_ack) px_arm <= 1'b0;   // one pixel is accepted once
       if (sm_auto_ack && sm_last) begin                // coordinates of the pixel whose results will be emitted
         sm_em_pack <= pack_p;
         sm_em_w    <= pack2_p[9:0];
@@ -713,6 +752,46 @@ module writeback #(
       pack2_p  <= WIDTH'(WIDTH'(cw_quot[9:0]) | (WIDTH'(iyc[21:0]) << 10));
     end
   // ============================================================================
+
+  logic tw_fl_start;
+  // ---- bank release / bundle end: release of a raw bank after its last pixel ----
+  // A bank is finished when its last pixel has been taken (ADDR_DONE) and nothing is left in the units that work on it.
+  wire units_idle = tw_items_idle && (ram_is_softmax ? (sm_idle && !sm_em_valid) : ram_is_pool ? (pool_idle && !pool_em_valid) : 1'b1);
+  wire bank_rel   = cfg[WB_A_ADDR_DONE][0] && units_idle && !rst_inner_rest;
+  wire last_bank_of_bundle = l_p && l_t && l_n && l_l && l_wkw2;
+  assign tw_fl_start = bank_rel && last_bank_of_bundle && !ram_is_last && ram_has_next;
+  logic cons_bank;            // raw bank that has just been consumed
+  logic fin_pending;          // the last bank of the last bundle is released; waiting for the last write to be acknowledged
+
+  // ---- OUTPUT WRITER (PL): see wb_tilewr.sv ----
+  // Takes every finished pixel (plain pixel, softmax class, pooled pixel): residual add RAM, tiling for the next bundle (tile RAM -> DDR),
+  // or y in DDR for the last bundle.
+  wire [WIDTH-1:0] tw_val = sm_em_valid ? sm_em_data : pool_em_valid ? pool_em_data : outval_p;
+  wire [4:0]       tw_n   = sm_em_valid ? sm_em_pack[4:0]  : pool_em_valid ? pool_em_n : pack_p[4:0];
+  wire [9:0]       tw_h   = sm_em_valid ? sm_em_pack[14:5] : pool_em_valid ? pool_em_h : pack_p[14:5];
+  wire [9:0]       tw_w   = sm_em_valid ? sm_em_w          : pool_em_valid ? pool_em_w : pack2_p[9:0];
+  wire [21:0]      tw_c   = sm_em_valid ? sm_em_k[21:0]    : pool_em_valid ? pool_em_c : pack2_p[31:10];
+
+  wb_tilewr #(
+    .WIDTH(WIDTH), .PE_ROWS(PE_ROWS), .X_BITS(X_BITS), .AXI_WIDTH(AXI_WIDTH), .AXI_ADDR_WIDTH(AXI_ADDR_WIDTH), .MAX_BURST(MAX_BURST),
+    .TILE_WORDS(TILE_WORDS), .ADD_WORDS(ADD_WORDS), .NHWC_WORDS(NHWC_WORDS)
+  ) TILEWR (
+    .clk(clk), .rstn(rstn),
+    .it_valid(tw_it_valid), .it_ready(tw_ready), .it_val($signed(tw_val)), .it_n(tw_n), .it_h(tw_h), .it_w(tw_w), .it_c(tw_c),
+    .p_is_last(ram_is_last), .p_is_softmax(ram_is_softmax), .p_is_flatten(ram_is_flatten), .p_has_next(ram_has_next), .p_add_base(ram_add_out),
+    .p_yn(ram_max_n + WIDTH'(1)), .p_yh(ram_is_pool ? WIDTH'(ram_ph) : ram_ch), .p_yw(ram_is_pool ? WIDTH'(ram_pw) : ram_cw), .p_yc(ram_co),
+    .p_oh(WIDTH'(ram_ohw[15:0])), .p_ow(WIDTH'(ram_ohw[31:16])), .p_oc(ram_oc),
+    .p_nx_l(WIDTH'(ram_nx_lw[15:0])), .p_nx_w(WIDTH'(ram_nx_lw[31:16])), .p_nx_cm(WIDTH'(ram_nx_cm[15:0])), .p_nx_cm_p0(WIDTH'(ram_nx_cm[31:16])),
+    .p_nx_xpw(ram_nx_xpw), .p_x_pad(WIDTH'(ram_x_pad)),
+    .p_out_base(ram_out_base), .p_out_bytes(ram_out_bytes),
+    .fl_start(tw_fl_start), .fl_done(tw_fl_done), .items_idle(tw_items_idle), .quiet(tw_quiet),
+    .add_we(add_wr_en), .add_addr(add_wr_addr), .add_data(add_wr_data),
+    .m_aw_valid(m_aw_valid), .m_aw_ready(m_aw_ready), .m_aw_addr(m_aw_addr), .m_aw_len(m_aw_len),
+    .m_w_valid(m_w_valid), .m_w_ready(m_w_ready), .m_w_data(m_w_data), .m_w_strb(m_w_strb), .m_w_last(m_w_last),
+    .m_b_valid(m_b_valid), .m_b_ready(m_b_ready),
+    .dbg_dump(bank_rel && last_bank_of_bundle), .dbg_ib(i_b)
+  );
+
 
   logic start_increment;
   logic start_increment_2;
@@ -775,25 +854,12 @@ module writeback #(
   logic [WIDTH-1:0] i_sram_addr;
   up_counter #(.W(WIDTH)) C_SRAM_ADDR (.clk(clk), .rstn_g(rstn), .rst_l(rst_inner), .en(en_counter_last), .max_in(32'hFFFF_FFFF), .last_clk(), .last(), .first(), .count(i_sram_addr));
  
-  localparam I_DELAY = 3;
-  logic i_valid_next;
-  n_delay #(.W(1), .N(I_DELAY)) I_VALID_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(i_valid_next));
-
 
   logic en_counter_delay;
   n_delay #(.W(1), .N(1)) P_PASS_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_delay));
 
   logic en_counter_hold_invalid;
   n_delay #(.W(1), .N(HOLD_INV_DELAY)) HOLD_INVALID_DELAY (.c(clk), .rng(rstn), .rnl(rstn), .e(1'b1), .i(en_count), .o(en_counter_hold_invalid));
-
-  logic all_done_now; //all done signal for firmware
-  assign all_done_now = l_b && l_p && l_t && l_n && l_l && l_wkw2;
-
-  // The i_valid_next pulse (I_DELAY clocks after en_count) can come before the next bundle's header is in ram_* (ram_rd_en ->
-  // valid_increment -> ram_rd_valid), so a last bundle whose limits differ from the previous bundle's was judged with the old limits.
-  // The counters restart on ram_rd_valid; the clock after it, the flags are judged with the new limits.
-  logic ram_rd_valid_d;
-  always_ff @(posedge clk) ram_rd_valid_d <= rstn && ram_rd_valid;
 
   logic clear_invalid;
 
@@ -812,6 +878,11 @@ module writeback #(
         addr_en_counter_hold <= 1'b0;
         rst_inner_rest       <= 1'b0;
         clear_invalid        <= 1'b0;
+        cons_bank            <= 1'b0;
+        fin_pending          <= 1'b0;
+        rel_valid            <= 1'b0;
+        rel_bank             <= 1'b0;
+        bundle_done          <= 1'b0;
       end else begin
 
             
@@ -836,7 +907,7 @@ module writeback #(
       if (addr_enable_counter) 
         cfg[WB_A_ADDR_EN_COUNTER] <= WIDTH'(0);
 
-      if (sm_auto_ack || pool_done)                      // PL accepts the logit pixel itself / has finished the pooling of the pixel
+      if (sm_auto_ack || pool_done || plain_ack)         // the pixel has been taken (plain pixel / softmax logit) / the pooling of the pixel is finished
         cfg[WB_A_ADDR_EN_COUNTER] <= WIDTH'(1);
       
 
@@ -852,20 +923,16 @@ module writeback #(
 
       if (start) begin
         cfg[WB_A_ALL_DONE] <= WIDTH'(0);
+        cfg[WB_A_BUNDLES_DONE] <= WIDTH'(0);
         cfg[WB_A_START] <= WIDTH'(0);
+        fin_pending <= 1'b0;
       end
-
-      if (i_valid_next) begin
-        if (all_done_now)
-          cfg[WB_A_ALL_DONE] <= WIDTH'(1);
-      end
-      if (ram_rd_valid_d && all_done_now)
-        cfg[WB_A_ALL_DONE] <= WIDTH'(1);
 
       if((bank_end) && (en_counter_last)) begin
         cfg[WB_A_ADDR_DONE] <= 1;
         rst_inner_rest <= 1;
         hold_invalid <= 1;
+        cons_bank <= raw_ocm_bank_rd;        // this bank is being finished (the read bank toggles one clock later)
       end
       if(wb_a_addr_done) 
         rst_inner_rest <= 0;
@@ -873,28 +940,34 @@ module writeback #(
 
       cfg[WB_A_DONE_WRITE_ANY] <= WIDTH'(cfg[WB_A_DONE_WRITE_0][0] || cfg[WB_A_DONE_WRITE_1][0]) ;
 
-      cfg[WB_A_BUNDLE_STATUS] <= WIDTH'(WIDTH'(cfg[WB_A_DONE_WRITE_0][0] || cfg[WB_A_DONE_WRITE_1][0]) | (WIDTH'(cfg[WB_A_ALL_DONE][0]) << 1));
-  
+      // ---- bank release: the bank is free for the DMA again, the bank counters move on ----
+      rel_valid   <= 1'b0;
+      bundle_done <= 1'b0;
+      if (bank_rel) begin
+        cfg[WB_A_ADDR_DONE] <= WIDTH'(0);
+        if (cons_bank) cfg[WB_A_DONE_WRITE_1] <= WIDTH'(0);
+        else           cfg[WB_A_DONE_WRITE_0] <= WIDTH'(0);
+        cfg[WB_A_EN_COUNT]  <= WIDTH'(1);
+        rel_valid <= 1'b1;
+        rel_bank  <= cons_bank;
+        if (last_bank_of_bundle) begin
+          if (ram_is_last)          fin_pending <= 1'b1;            // all done once the last write is acknowledged
+          else if (!ram_has_next) begin                              // output only feeds a residual add: nothing to flush
+            bundle_done <= 1'b1;
+            cfg[WB_A_BUNDLES_DONE] <= cfg[WB_A_BUNDLES_DONE] + WIDTH'(1);
+          end
+        end
+      end
+      if (tw_fl_done) begin                                          // tile RAM is in DDR: the next bundle may read it
+        bundle_done <= 1'b1;
+        cfg[WB_A_BUNDLES_DONE] <= cfg[WB_A_BUNDLES_DONE] + WIDTH'(1);
+      end
+      if (fin_pending && tw_quiet) begin
+        fin_pending <= 1'b0;
+        cfg[WB_A_ALL_DONE] <= WIDTH'(1);
+        cfg[WB_A_BUNDLES_DONE] <= cfg[WB_A_BUNDLES_DONE] + WIDTH'(1);
+      end
 
-      cfg[WB_A_IY_NHWC_CONV] <= iy_nhwc_conv;
-      if (sm_em_valid)                                   // softmax result of one class: valid pixel for the PS
-        cfg[WB_A_OUT_FLAGS] <= WIDTH'(sm_em_data & 32'h3FFF_FFFF);
-      else if (pool_em_valid)                            // pooled pixel: valid pixel for the PS
-        cfg[WB_A_OUT_FLAGS] <= WIDTH'(pool_em_data & 32'h3FFF_FFFF);
-      else if (ram_is_softmax)                           // logits are hidden; done only once the softmax unit is idle
-        cfg[WB_A_OUT_FLAGS] <= WIDTH'((WIDTH'(cfg[WB_A_ADDR_DONE][0] && sm_idle) << 30) | (WIDTH'(1) << 31));
-      else if (ram_is_pool)                              // conv pixels are hidden; the PS only sees pooled pixels
-        cfg[WB_A_OUT_FLAGS] <= WIDTH'((WIDTH'(cfg[WB_A_ADDR_DONE][0] && pool_idle) << 30) | (WIDTH'(1) << 31));
-      else
-        cfg[WB_A_OUT_FLAGS] <= WIDTH'((outval_p & 32'h3FFF_FFFF) 
-                     | (WIDTH'(cfg[WB_A_ADDR_DONE][0])    << 30) 
-                     | (WIDTH'(cfg[WB_A_ADDR_INVALID][0]) << 31));
-      cfg[WB_A_PIXEL_PACK  ] <= sm_em_valid   ? sm_em_pack :
-                                pool_em_valid ? (WIDTH'(pool_em_n) | (WIDTH'(pool_em_h) << 5)) : pack_p;
-      cfg[WB_A_PIXEL_PACK2 ] <= sm_em_valid   ? (WIDTH'(sm_em_w) | (WIDTH'(sm_em_k[21:0]) << 10)) :
-                                pool_em_valid ? (WIDTH'(pool_em_w) | (WIDTH'(pool_em_c) << 10)) : pack2_p;
-
-      
 
       if (rstn && beat_handshake && out_tlast) begin
           if (raw_ocm_bank == 1'b0) cfg[WB_A_DONE_WRITE_0] <= WIDTH'(1);
@@ -903,7 +976,7 @@ module writeback #(
  
 
     
-      if (reg_wr_en && reg_wr_addr < N_REG && !(em_any_valid && reg_wr_addr == WB_A_ADDR_EN_COUNTER)) // PS has priority in writing to registers (its ack of a softmax result must not move the counters)
+      if (reg_wr_en && reg_wr_addr < N_REG)              // PS has priority in writing to registers (it only writes START and N_BUNDLES_1)
         cfg[reg_wr_addr] <= WIDTH'(reg_wr_data);
 
     end

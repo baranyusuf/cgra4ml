@@ -98,7 +98,7 @@ module wb_pool #(
   // ---------------- sequential divider for the average ----------------
   logic               d_start, d_busy, d_done;
   logic [ACC_W-1:0]   d_num, d_den, d_q;
-  wb_udiv_seq #(.NW(ACC_W)) DIV_AVG (.clk(clk), .rstn(rstn), .start(d_start), .num(d_num), .den(d_den), .busy(d_busy), .done(d_done), .q(d_q));
+  wb_udiv_seq #(.NW(ACC_W)) DIV_AVG (.clk(clk), .rstn(rstn), .start(d_start), .num(d_num), .den(d_den), .busy(d_busy), .done(d_done), .q(d_q), .rem());
 
   // ---------------- FSM ----------------
   typedef enum logic [4:0] {
@@ -396,7 +396,8 @@ module wb_udiv_seq #(
   input  logic [NW-1:0] den,
   output logic          busy,
   output logic          done,
-  output logic [NW-1:0] q
+  output logic [NW-1:0] q,
+  output logic [NW-1:0] rem        // remainder, valid together with done
 );
   localparam CW = $clog2(NW + 1);
   logic [NW-1:0] n_r, d_r;
@@ -404,6 +405,7 @@ module wb_udiv_seq #(
   logic [CW-1:0] i;
   wire  [NW:0]   t  = {r[NW-1:0], n_r[NW-1]};
   wire           ge = (t >= {1'b0, d_r});
+  assign rem = r[NW-1:0];
 
   always_ff @(posedge clk)
     if (!rstn) begin

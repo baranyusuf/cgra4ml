@@ -153,9 +153,10 @@ def export_inference(model, hw, batch_size=1):
     '''
     Write Runtime Headers
     '''
-    x_bytes_all = x_bytes = w_bytes = b_words = x_bytes_max = nhwc_words_max = o_bytes_max = o_words_max = 0
+    x_bytes_all = x_bytes = w_bytes = b_words = x_bytes_max = nhwc_words_max = o_bytes_max = 0
     sm_words = 0
     pool_words = 0
+    tile_words = 0
     assert all(bb.softmax_frac <= hw.SM_TAB_F for bb in BUNDLES if bb.softmax), f"softmax_frac must be <= {hw.SM_TAB_F} (X_BITS-1)"
     with open (f'./config_fw.h', 'w') as ch:
 
@@ -204,10 +205,11 @@ def export_inference(model, hw, batch_size=1):
                 assert b.pool is None, "PL softmax bundle cannot have pooling"
                 assert (b.softmax_act is None) == (ib == len(BUNDLES)-1), "softmax=True (float probabilities) is for the last bundle; a softmax in an earlier bundle needs softmax=XActivation(...) to quantize its output for the next bundle"
 
+            if ib != len(BUNDLES)-1 and len(b.next_ibs) != 0:
+                tile_words = max(tile_words, o_words_b)   # tile RAM holds the whole tiled output of the bundle (X_BITS per element)
             x_bytes_max = max(x_bytes_max, x_bytes_b)
             nhwc_words_max = max(nhwc_words_max, nhwc_words_b)
             o_bytes_max = max(o_bytes_max, o_bytes_b)
-            o_words_max = max(o_words_max, o_words_b)
             w_bytes += w_bytes_b
             x_bytes_all += x_bytes_b
 
@@ -249,8 +251,7 @@ def export_inference(model, hw, batch_size=1):
             ch.write(     f".is_bias={1*(b.core.b is not None):<3}, .is_flatten={1*(b.flatten is not None):<3}, .is_softmax={1*(b.softmax is not None):<3}, .sm_shift={hw.SM_TAB_F - b.softmax_frac if b.softmax else 0:<3}, .sm_out_frac={b.softmax_act.out.frac if b.softmax_act is not None else 0:<3}, ")
             ch.write(     f".x_pad={b.r.X_PAD:<3}, .b_val_shift={b.core.bias_val_shift:<3}, .b_bias_shift={b.core.bias_b_shift:<3}, .ca_nzero={ca_nzero:<3}, .ca_shift={ca_shift:<3}, .ca_pl_scale={ca_pl_scale:<3}, .aa_nzero={aa_nzero:<3}, .aa_shift={aa_shift:<3}, .aa_pl_scale={aa_pl_scale:<3}, .add_val_shift={add_val_shift:<3}, .add_a_shift={add_a_shift:<3}, .pa_nzero={pa_nzero:<3}, .pa_shift={pa_shift:<3}, .pa_pl_scale={pa_pl_scale:<3}, ")
             ch.write(     f".csh={b.r.CSH:<3}, .csh_shift={b.r.CSH_SHIFT:<3}, .psh_shift={b.r.PSH_SHIFT:<3}, .csw={b.r.CSW:<3}, .csw_shift={b.r.CSW_SHIFT:<3}, .psw_shift={b.r.PSW_SHIFT:<3}, .pool={pool_type:<10}, ")
-            ch.write(     f".header={b.r.header:>23}u, ")
-            ch.write(     f".debug_nhwc_words={b.oe_exp_nhwc.size:<9} }}")
+            ch.write(     f".header={b.r.header:>23}u }}")
             
             b_words += b.be.size if b.core.b else 0
             if b.ib != len(BUNDLES)-1:
@@ -270,18 +271,16 @@ def export_inference(model, hw, batch_size=1):
         ch.write(f"#define W_BYTES     {w_bytes}\n")
         ch.write(f"#define X_BYTES     {x_bytes}\n")
         ch.write(f"#define O_WORDS     {o_words}\n")
-        ch.write(f"#define O_WORDS_MAX {o_words_max}\n")
-        ch.write(f"#define O_BYTES_MAX {o_bytes_max}\n")
+        ch.write(f"#define O_BYTES_MAX {-(-o_bytes_max//64)*64}  // rounded up to 64 bytes: the PL writes whole AXI beats, every out buffer starts on a 64 byte boundary\n")
         ch.write(f"#define X_BYTES_ALL {x_bytes_all}\n")
         ch.write(f"#define NHWC_WORDS  {nhwc_words_max}\n")
         ch.write(f"#define Y_TYPE      int{hw.Y_OUT_BITS}_t\n")
         ch.write(f"#define B_TYPE      int{hw.B_BITS}_t\n")
         ch.write(f"#define O_TYPE      {out_type}\n")
         ch.write(f"#define B_WORDS     {b_words}\n")
-        ch.write(f"#define WB_BIAS_BASE ({32 + hw.MAX_N_BUNDLES*32})  // word offset of bias RAM inside the writeback register space (32 regs + 32 words per bundle)\n")
-        ch.write(f"#define WB_ADD_BASE  ({32 + hw.MAX_N_BUNDLES*32 + max(b_words, 1)})  // word offset of the residual-add buffer RAM (right after the bias RAM); buffer k element i is at WB_ADD_BASE + k*NHWC_WORDS + i\n")
+        ch.write(f"#define WB_BIAS_BASE ({32 + hw.MAX_N_BUNDLES*64})  // word offset of bias RAM inside the writeback register space (32 regs + 64 words per bundle)\n")
         add_words = max(len(add_buffer_map) * nhwc_words_max, 1)
-        sm_tab_base  = 32 + hw.MAX_N_BUNDLES*32 + max(b_words, 1) + add_words      # exp table window (SM_TAB_N words)
+        sm_tab_base  = 32 + hw.MAX_N_BUNDLES*64 + max(b_words, 1) + add_words      # exp table window (SM_TAB_N words)
         ch.write(f"#define WB_SM_TAB_BASE  ({sm_tab_base})   // word offset of the softmax exp table (SM_TAB_N words) inside the writeback register space\n")
         ch.write(f"#define SM_FRAC_BITS 24      // exp table and probabilities are fixed point with 24 fractional bits\n")
         ch.write(f"#define AXI_WIDTH   {hw.AXI_WIDTH}\n")
@@ -294,10 +293,6 @@ def export_inference(model, hw, batch_size=1):
         sm_tab = softmax_exp_table(hw.SM_TAB_F, hw.SM_TAB_N)      # one table for every softmax bundle (each bundle shifts its index by sm_shift)
         ch.write(f"#define SM_TAB_N    {len(sm_tab)}\n")
         ch.write(f"static const uint32_t sm_tab [SM_TAB_N] = {{ {', '.join(str(int(v)) for v in sm_tab)} }};\n")
-
-        mask_nums = [(2**hw.X_BITS-1) << (p*hw.X_BITS)  for p in range(8//hw.X_BITS)]
-        mask_nums = ~np.array(mask_nums, dtype=np.uint8)
-        ch.write(f"static const uint8_t X_POSITION_INVERTED_MASKS [] = {{ {', '.join([str(n) for n in mask_nums])} }};\n")
 
         '''
         Write Binary Files
@@ -372,6 +367,7 @@ def export_inference(model, hw, batch_size=1):
     hw.RAM_ADD_DEPTH  = max(len(add_buffer_map) * nhwc_words_max, 1)
     hw.RAM_SOFTMAX_DEPTH = max(sm_words, 1)
     hw.RAM_POOL_DEPTH = max(pool_words, 1)
+    hw.RAM_TILE_DEPTH = max(tile_words, 1)
     hw.export()  # config_hw.svh'yi gerçek NHWC_WORDS ile tazele
 
 

@@ -262,6 +262,17 @@ dma_controller #(
     .rstn(rstn),
     .reg_wr_en(reg_wr_en),
 	.o_ready(m_axis_output_tready),
+    .m_aw_valid(m_axi_output_awvalid),
+    .m_aw_ready(m_axi_output_awready),
+    .m_aw_addr (m_axi_output_awaddr ),
+    .m_aw_len  (m_axi_output_awlen  ),
+    .m_w_valid (m_axi_output_wvalid ),
+    .m_w_ready (m_axi_output_wready ),
+    .m_w_data  (m_axi_output_wdata  ),
+    .m_w_strb  (m_axi_output_wstrb  ),
+    .m_w_last  (m_axi_output_wlast  ),
+    .m_b_valid (m_axi_output_bvalid ),
+    .m_b_ready (m_axi_output_bready ),
     .reg_wr_ack(reg_wr_ack),
     .reg_wr_addr(reg_wr_addr_ctrl[AXI_ADDR_WIDTH-1:0]),
     .reg_wr_data(reg_wr_data),
@@ -444,20 +455,13 @@ alex_axi_dma_rd #(
 
 
 
+// Output write master (driven by the writeback inside CONTROLLER): bursts of the tiled bundle outputs and single words of the final y.
+// Static fields: id 0, INCR bursts, full width beats, normal bufferable memory.
 assign m_axi_output_awid    = {AXI_ID_WIDTH{1'b0}};
-assign m_axi_output_awaddr  = {AXI_ADDR_WIDTH{1'b0}};
-assign m_axi_output_awlen   = 8'b0;
-assign m_axi_output_awsize  = 3'b0;
-assign m_axi_output_awburst = 2'b0;
+assign m_axi_output_awsize  = 3'($clog2(AXI_STRB_WIDTH));
+assign m_axi_output_awburst = 2'b01;
 assign m_axi_output_awlock  = 1'b0;
-assign m_axi_output_awcache = 4'b0;
+assign m_axi_output_awcache = 4'b0011;
 assign m_axi_output_awprot  = 3'b0;
-assign m_axi_output_awvalid = 1'b0;
-assign m_axi_output_wdata   = {AXI_WIDTH{1'b0}};
-assign m_axi_output_wstrb   = {AXI_STRB_WIDTH{1'b0}};
-assign m_axi_output_wlast   = 1'b0;
-assign m_axi_output_wvalid  = 1'b0;
-assign m_axi_output_bready  = 1'b0;
-
 
 endmodule

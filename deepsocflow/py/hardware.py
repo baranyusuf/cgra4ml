@@ -114,6 +114,7 @@ class Hardware:
         self.RAM_ADD_DEPTH         = 0   # set by export_inference(): residual-add buffers (bytes) kept in PL
         self.RAM_SOFTMAX_DEPTH     = 0   # set by export_inference(): output words of the softmax bundle (logit / probability RAMs in PL)
         self.RAM_POOL_DEPTH        = 0   # set by export_inference(): conv-output words of the largest pooled bundle (pool RAM in PL)
+        self.RAM_TILE_DEPTH        = 0   # set by export_inference(): elements (X_BITS each) of the largest tiled bundle output (tile RAM in PL)
         self.BITS_KW2              = clog2((self.KW_MAX+1)/2)
         self.BITS_KH2              = clog2((self.KH_MAX+1)/2)
         self.BITS_CIN_MAX          = clog2(self.CI_MAX)
@@ -211,6 +212,7 @@ class Hardware:
 `define ADD_WORDS           {self.RAM_ADD_DEPTH      :<10} 
 `define SOFTMAX_WORDS       {self.RAM_SOFTMAX_DEPTH  :<10}
 `define POOL_WORDS          {self.RAM_POOL_DEPTH     :<10}
+`define TILE_WORDS          {self.RAM_TILE_DEPTH     :<10}  // elements of the largest tiled bundle output
 `define SOFTMAX_TAB_N       {self.SM_TAB_N:<10}  // exp table entries
 ''')
 
@@ -220,23 +222,13 @@ WB_A_START           = 0,
 WB_A_N_BUNDLES_1     ,
 WB_A_EN_COUNT        ,
 WB_A_ALL_DONE        ,
-WB_A_ADDR_EN_COUNTER ,     
-WB_A_ADDR_DONE       ,  
-WB_A_ADDR_IYN        ,   
-WB_A_ADDR_IYC        ,
-WB_A_I_BIAS          ,   
-WB_A_IY_NHWC_CONV    ,
+WB_A_ADDR_EN_COUNTER ,
+WB_A_ADDR_DONE       ,
 WB_A_ADDR_INVALID    ,
 WB_A_DONE_WRITE_0    ,
 WB_A_DONE_WRITE_1    ,
 WB_A_DONE_WRITE_ANY  ,
-WB_A_OUT_VAL_HW      ,
-WB_A_ICH_QUOT        ,  
-WB_A_ICW_QUOT        ,
-WB_A_BUNDLE_STATUS   ,
-WB_A_PIXEL_PACK      ,
-WB_A_OUT_FLAGS       ,
-WB_A_PIXEL_PACK2     ,
+WB_A_BUNDLES_DONE    ,
 ''')
 
         with open('config_hw.tcl', 'w') as f:
@@ -311,11 +303,11 @@ set CONFIG_BASEADDR    0x{self.CONFIG_BASEADDR}
         if SIM == 'xsim':
             with open('build/xsim_cfg.tcl', 'w') as f:
                 f.write('''log_wave -recursive * \nrun all \nexit''')
-            assert subprocess.run(fr'{SIM_PATH}xsim {self.TB_MODULE} --tclbatch xsim_cfg.tcl', cwd="build", shell=True).returncode == 0
+            assert subprocess.run(fr'{SIM_PATH}xsim {self.TB_MODULE} --tclbatch xsim_cfg.tcl --testplusarg DATA_DIR=../{self.DATA_DIR}', cwd="build", shell=True).returncode == 0
         if SIM == 'icarus':
-            subprocess.run(["vvp", "build/a.out"])
+            subprocess.run(["vvp", "build/a.out", f"+DATA_DIR=../{self.DATA_DIR}"])
         if SIM == 'verilator':
-            assert subprocess.run([f"./V{self.TB_MODULE}"], cwd="build").returncode == 0
+            assert subprocess.run([f"./V{self.TB_MODULE}", f"+DATA_DIR=../{self.DATA_DIR}"], cwd="build").returncode == 0
         
         print(f"\n\nSIMULATION TIME: {time.time()-start:.2f} seconds\n\n")
 
